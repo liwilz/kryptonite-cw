@@ -206,3 +206,12 @@ n,family,cond,sub,params,fold0,fold1,fold2,fold3,fold4
 40,lrfull,sel,lrfull,"{""pen"": ""l1"", ""C"": 0.01}",0.96309,0.95957,0.96211,0.95859,0.95898
 40,lrfull,sel,lrfull,"{""pen"": ""l1"", ""C"": 0.03}",0.96309,0.95957,0.96211,0.95859,0.95898
 40,lrfull,sel,lrfull,"{""pen"": ""l1"", ""C"": 0.1}",0.96309,0.95957,0.96211,0.95859,0.95898
+20,kpoly,all,"deg20 C check, fold 0","{""deg"": 20, ""C"": 0.1}",0.54479
+20,kpoly,all,"deg20 C check, fold 0","{""deg"": 20, ""C"": 10}",0.59792
+20,kpoly,all,"deg20 C check, fold 0","{""deg"": 20, ""C"": 1000}",0.6026
+30,kpoly,all,"deg30 C check, fold 0","{""deg"": 30, ""C"": 0.1}",0.50062
+30,kpoly,all,"deg30 C check, fold 0","{""deg"": 30, ""C"": 10}",0.54625
+30,kpoly,all,"deg30 C check, fold 0","{""deg"": 30, ""C"": 1000}",0.55031
+40,kpoly,all,"deg40 C check, fold 0","{""deg"": 40, ""C"": 0.1}",0.50176
+40,kpoly,all,"deg40 C check, fold 0","{""deg"": 40, ""C"": 10}",0.50195
+40,kpoly,all,"deg40 C check, fold 0","{""deg"": 40, ""C"": 1000}",0.50176
