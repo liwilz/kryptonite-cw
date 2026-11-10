@@ -1,0 +1,244 @@
+{
+ "seed": 0,
+ "cv_folds": 5,
+ "n_values": [
+  20,
+  30,
+  40
+ ],
+ "quick": false,
+ "grid_hash": "83f39b867b50",
+ "grid": {
+  "C_L2": [
+   0.001,
+   0.01,
+   0.1,
+   1
+  ],
+  "C_L1": [
+   0.003,
+   0.01,
+   0.03,
+   0.1
+  ],
+  "MAX_DEG": {
+   "20": 4,
+   "30": 3,
+   "40": 2
+  },
+  "DT_DEPTH": [
+   2,
+   4,
+   6,
+   8,
+   12,
+   null
+  ],
+  "DT_LEAF": [
+   1,
+   10
+  ],
+  "RF_TREES": 200,
+  "RF_MAXF": [
+   "sqrt",
+   0.5,
+   1.0
+  ],
+  "RF_LEAF": [
+   1,
+   5
+  ],
+  "HGB_DEPTH": [
+   3,
+   6,
+   null
+  ],
+  "KM_K": [
+   8,
+   32,
+   128
+  ],
+  "MLP_H": [
+   [
+    128,
+    128
+   ]
+  ],
+  "KP_DEGS": {
+   "20": [
+    10,
+    20,
+    40
+   ],
+   "30": [
+    10,
+    30,
+    60
+   ],
+   "40": [
+    10,
+    40,
+    80
+   ]
+  },
+  "KP_C": 0.85,
+  "MLP_ALPHA": [
+   0.01
+  ],
+  "MLP_MAXITER": 400,
+  "KN_MAXITER": 60,
+  "KN_PATIENCE": 15,
+  "MLP_PATIENCE": 50,
+  "SEL_RF_MAXF": [
+   "sqrt",
+   1.0
+  ],
+  "SEL_RF_LEAF": [
+   1,
+   5
+  ],
+  "LC_SIZES": [
+   250,
+   500,
+   1000,
+   2000,
+   4000
+  ],
+  "LC_FOLDS": [
+   0,
+   1,
+   2
+  ],
+  "LC_TOP": 3,
+  "NULL_REPS": 20
+ },
+ "flags": {
+  "RUN_KRYPTONET_SIZED": true,
+  "WRITE_PREDICTIONS": true
+ },
+ "selector": {
+  "z_floor": 4.0,
+  "max_bits": 14,
+  "mass_thr": 0.02
+ },
+ "seeds_used": "SEED for the locked split, the folds, every model and the inner CV; SEED+fold for training-subset draws; 1000+fold for shuffled labels; fixed small integers for the unit-test and synthetic data of section 5; random_state=42 only for the paper's own split in the Figure 2 reproduction",
+ "final": {
+  "20": {
+   "pipeline": "LR on all monomials on selected bits",
+   "key": [
+    "lrfull",
+    "sel",
+    "lrfull"
+   ],
+   "params": {
+    "pen": "l1",
+    "C": 0.003
+   },
+   "cv_mean": 0.9597916666666666,
+   "cv_sd": 0.0057810153856298644,
+   "locked_accuracy": 0.9583333333333334,
+   "selected_bits_fit_on_dev": [
+    0,
+    1,
+    2,
+    4,
+    5,
+    7,
+    9,
+    10,
+    12,
+    15
+   ],
+   "selected_bits_final_fit_on_all_labelled": [
+    0,
+    1,
+    2,
+    4,
+    5,
+    7,
+    9,
+    10,
+    12,
+    15
+   ]
+  },
+  "30": {
+   "pipeline": "LR on all monomials on selected bits",
+   "key": [
+    "lrfull",
+    "sel",
+    "lrfull"
+   ],
+   "params": {
+    "pen": "l1",
+    "C": 0.003
+   },
+   "cv_mean": 0.9620625,
+   "cv_sd": 0.0023758222260935333,
+   "locked_accuracy": 0.9585,
+   "selected_bits_fit_on_dev": [
+    2,
+    5,
+    10,
+    11,
+    14,
+    17,
+    19,
+    20,
+    26,
+    28
+   ],
+   "selected_bits_final_fit_on_all_labelled": [
+    2,
+    5,
+    10,
+    11,
+    14,
+    17,
+    19,
+    20,
+    26,
+    28
+   ]
+  },
+  "40": {
+   "pipeline": "random forest on selected bits",
+   "key": [
+    "rf",
+    "sel",
+    "rf"
+   ],
+   "params": {
+    "max_features": "sqrt",
+    "msl": 1
+   },
+   "cv_mean": 0.9604687500000001,
+   "cv_sd": 0.0020042146144320944,
+   "locked_accuracy": 0.95890625,
+   "selected_bits_fit_on_dev": [
+    6,
+    7,
+    12,
+    15,
+    21,
+    24,
+    25,
+    30,
+    36,
+    39
+   ],
+   "selected_bits_final_fit_on_all_labelled": [
+    6,
+    7,
+    12,
+    15,
+    21,
+    24,
+    25,
+    30,
+    36,
+    39
+   ]
+  }
+ }
+}
