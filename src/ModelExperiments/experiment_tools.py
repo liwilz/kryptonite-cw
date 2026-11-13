@@ -1,4 +1,4 @@
-"""Helpers for Experiments.ipynb: settings, data splits, the bit selector, the models, result
+"""Helpers for Experiments.ipynb: settings, data splits, the models, the bit elimination, result
 storage, tables and figures. The notebook calls these; the experiments themselves are in it."""
 
 import hashlib
@@ -17,16 +17,14 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import sklearn
-from scipy import stats
 from sklearn.cluster import KMeans
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PolynomialFeatures
-from sklearn.tree import DecisionTreeClassifier
 
 # ---- Settings. KRYP_QUICK=1 runs a tiny dry run (see the end of this block); its numbers mean
 # nothing.
@@ -37,73 +35,56 @@ NS = (20, 30, 40)
 SEED = 0  # fixes the locked split, the folds and every model
 K = 5  # CV folds
 ROWS = None  # None = all labelled rows
-OUT, FIG = "exp_results", "exp_figures"
+OUT, FIG = "exp_cache", "exp_figures"  # OUT only lets an interrupted run resume
 WRITE_PREDICTIONS = True
-RUN_KRYPTONET_SIZED = True  # the 4 x 512 MLP, on fold 0 only because it is slow
+RUN_MLP = True  # the 4 x 512 MLP: about an hour on a laptop CPU
+MAX_BITS = 14  # most bits the elimination may keep: a degree-10 polynomial on more is too large
 
-# Search grids. Changing one only adds new results to OUT/; stored results of other settings stay
-# valid.
 G = dict(
     C_L2=[1e-3, 1e-2, 1e-1, 1],
     C_L1=[3e-3, 1e-2, 3e-2, 1e-1],
-    MAX_DEG={20: 4, 30: 3, 40: 2},  # largest explicit polynomial degree that fits in memory
-    DT_DEPTH=[2, 4, 6, 8, 12, None],
-    DT_LEAF=[1, 10],
+    MAX_DEG={20: 4, 30: 3, 40: 2},  # largest degree whose monomials on all bits fit in memory
+    KP_DEGS={n: [6, 10, 15, n, 2 * n] for n in NS},  # degrees of the paper's kernel
+    KP_C=0.85,
     RF_TREES=200,
     RF_MAXF=["sqrt", 0.5, 1.0],
     RF_LEAF=[1, 5],
-    HGB_DEPTH=[3, 6, None],
     KM_K=[8, 32, 128],
-    MLP_H=[[128, 128]],
-    KP_DEGS={20: [10, 20, 40], 30: [10, 30, 60], 40: [10, 40, 80]},  # degree 10, n and 2n
-    KP_C=0.85,
-    MLP_ALPHA=[1e-2],
-    MLP_MAXITER=400,
-    KN_MAXITER=60,  # epoch cap of the 4 x 512 MLP
-    KN_PATIENCE=15,
-    MLP_PATIENCE=50,
-    SEL_RF_MAXF=["sqrt", 1.0],
-    SEL_RF_LEAF=[1, 5],
+    MLP_H=[512, 512, 512, 512],  # KryptoNet's shape
+    MLP_ALPHA=1e-2,
+    MLP_MAXITER=60,  # epoch cap that bounds the run time
+    MLP_PATIENCE=15,
+    SEL_DEGS=list(range(1, 11)),  # degrees tried on the selected bits
     LC_SIZES=[250, 500, 1000, 2000, 4000],  # learning curves; the full fold-train set is added
     LC_FOLDS=(0, 1, 2),
-    LC_TOP=3,
-    NULL_REPS=20,  # shuffled-label runs of the selector per n
 )
 if QUICK:  # dry run: 3 folds, 3,000 rows, small grids, separate folders, no predictions
-    K, ROWS, OUT, FIG, WRITE_PREDICTIONS = 3, 3000, "exp_results_quick", "exp_figures_quick", False
+    K, ROWS, OUT, FIG, WRITE_PREDICTIONS = 3, 3000, "exp_cache_quick", "exp_figures_quick", False
     G.update(
         C_L2=[1e-2, 1e-1],
         C_L1=[1e-2, 1e-1],
         MAX_DEG={20: 2, 30: 2, 40: 2},
-        DT_DEPTH=[4, None],
+        KP_DEGS={n: [10, n] for n in NS},
         RF_TREES=30,
         RF_MAXF=["sqrt", 1.0],
-        HGB_DEPTH=[3, None],
+        RF_LEAF=[5],
         KM_K=[4, 16],
-        MLP_H=[[64, 64]],
-        KP_DEGS={20: [10, 20], 30: [10, 30], 40: [10, 40]},
         MLP_MAXITER=40,
-        KN_MAXITER=40,
-        KN_PATIENCE=10,
         MLP_PATIENCE=10,
+        SEL_DEGS=[2, 6, 10],
         LC_SIZES=[100, 250, 500],
         LC_FOLDS=(0, 1),
-        LC_TOP=2,
-        NULL_REPS=3,
     )
 if not os.path.isfile(f"{DATA}/kryptonite-20-X.npy"):
     raise FileNotFoundError(
         f"{DATA}/kryptonite-20-X.npy not found: run from a folder inside the repository"
     )
 os.makedirs(OUT, exist_ok=True)
-with open(f"{OUT}/.gitignore", "w") as f:  # stored results only let an interrupted run resume
+with open(f"{OUT}/.gitignore", "w") as f:
     f.write("*\n")
 os.makedirs(FIG, exist_ok=True)
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", message=".*encountered in matmul")
-
-
-# ---- Data and splits: a locked 20% test set and K stratified folds on the other 80% (dev)
 
 
 # ---- Names used in tables and figures
@@ -111,22 +92,10 @@ NAME = dict(
     lr_l2="LR, L2",
     lr_l1="LR, L1",
     kpoly="Kernel LR",
-    lrfull="LR on all monomials",
-    dtree="Decision tree",
     rf="Random forest",
-    hgb="Gradient boosting",
-    mlp="MLP 2×128",
-    kmeans_major="K-means (cluster majority)",
-    kmeans_onehot="K-means (one-hot + LR)",
+    kmeans="K-means",
+    mlp="MLP 4×512",
     paper="Paper baseline",
-)
-SHORT = dict(
-    NAME,
-    rf="Forest",
-    hgb="Boosting",
-    mlp="MLP",
-    kmeans_major="K-means",
-    kmeans_onehot="K-means + LR",
 )
 
 
@@ -136,38 +105,21 @@ def kname(key):
     return (
         NAME[fam]
         + (f", degree {sub[3:]}" if sub.startswith("deg") else "")
-        + (" on selected bits" if cond != "all" else "")
-    )
-
-
-def sname(key):
-    """Short name for figure axes."""
-    fam, cond, sub = key
-    s = SHORT[fam] + (f", degree {sub[3:]}" if sub.startswith("deg") and fam != "paper" else "")
-    return s + (
-        ", selected bits"
-        if cond != "all"
-        else (", all bits" if fam in ("rf", "dtree", "hgb") else "")
+        + (" on the selected bits" if cond == "sel" else "")
     )
 
 
 def show_params(p):
-    """{"max_features": 1.0, "msl": 5} -> "max features 1.0, min leaf 5"."""
-    names = dict(
-        msl="min leaf",
-        max_features="max features",
-        max_depth="max depth",
-        deg="degree",
-        pen="penalty",
-        h="layers",
-    )
+    """{"deg": 4, "C": 0.01} -> "degree 4, C 0.01"."""
+    names = dict(deg="degree", h="layers", max_features="max features", msl="min leaf")
     out = []
     for k, v in (p or {}).items():
-        v = f"{len(v)}×{v[0]}" if k == "h" and len(set(v)) == 1 else ("none" if v is None else v)
+        v = f"{len(v)}×{v[0]}" if k == "h" else v
         out.append(f"{names.get(k, k)} {v}")
     return ", ".join(out)
 
 
+# ---- Data and splits: a locked 20% test set and K stratified folds on the other 80% (dev)
 _DATA = {}
 
 
@@ -220,185 +172,114 @@ def check_protocol():
         )
 
 
-Z_FLOOR = 4.0  # only coefficients above this many standard errors are stored
+# ---- Result store: one JSON line per finished result, so an interrupted run resumes
+class Store:
+    def __init__(self, name):
+        self.path, self.rows = f"{OUT}/{name}.jsonl", {}
+        if os.path.exists(self.path):
+            for line in open(self.path):
+                r = json.loads(line)
+                self.rows[r["key"]] = r
+
+    def where(self, **kw):
+        return [r for r in self.rows.values() if all(r.get(k) == v for k, v in kw.items())]
 
 
-@lru_cache(None)
-def _triu(m):
-    return np.triu_indices(m, 1)
+CV, LC, SEL, FIN = (Store(nm) for nm in ("cv_results", "learning_curves", "elimination", "final"))
 
 
-def scan_core(R, z, maxdeg):
-    """mean(z * prod(R[:, T])) for every subset T of the columns of R with |T| = 1..maxdeg (at most
-    4), via matrix products. Returns {k: (subsets as an array of column indices, coefficients)}.
-    """
-    N, m = R.shape
-    R = np.ascontiguousarray(R, dtype=np.float32)
-    z = np.asarray(z, dtype=np.float32)
-    assert maxdeg <= 4
-    out = {1: (np.arange(m)[:, None], (R.T @ z) / N)}
-    if maxdeg >= 2:
-        M = (R * z[:, None]).T @ R / N
-        iu = _triu(m)
-        out[2] = (np.stack(iu, 1), M[iu])
-    if maxdeg >= 3:
-        cs, vs = [], []
-        for i in range(m - 2):
-            Rs = R[:, i + 1 :]
-            M = (Rs * (z * R[:, i])[:, None]).T @ Rs / N
-            a, b = _triu(m - i - 1)
-            cs.append(np.stack([np.full(len(a), i), a + i + 1, b + i + 1], 1))
-            vs.append(M[a, b])
-        out[3] = (np.concatenate(cs), np.concatenate(vs))
-    if maxdeg >= 4:
-        cs, vs = [], []
-        for i in range(m - 3):
-            for j in range(i + 1, m - 2):
-                Rs = R[:, j + 1 :]
-                M = (Rs * (z * R[:, i] * R[:, j])[:, None]).T @ Rs / N
-                a, b = _triu(m - j - 1)
-                cs.append(
-                    np.stack([np.full(len(a), i), np.full(len(a), j), a + j + 1, b + j + 1], 1)
-                )
-                vs.append(M[a, b])
-        out[4] = (np.concatenate(cs), np.concatenate(vs))
-    return out
+def _label(key, meta):
+    """Short description of a result for the progress line."""
+    if "family" not in meta:
+        return key
+    parts = [meta["exp"], f"n={meta['n']}", meta["sub"], show_params(meta.get("params"))]
+    return " ".join(str(p) for p in parts if p)
 
 
-def scan_bits(B, y, maxdeg=4):
-    """Steps 1 and 2: the gate, its coefficient, and every scanned coefficient above Z_FLOOR
-    standard errors."""
-    N, n = B.shape
-    s = (2.0 * y - 1).astype(np.float32)
-    C = (B * s[:, None]).T @ B / N
-    np.fill_diagonal(C, 0.0)
-    a, b = np.unravel_index(np.argmax(np.abs(C)), C.shape)
-    pair = (int(min(a, b)), int(max(a, b)))
-    rest = np.array([i for i in range(n) if i not in pair])
-    res = scan_core(B[:, rest], s * B[:, pair[0]] * B[:, pair[1]], maxdeg)
-    thr = Z_FLOOR / np.sqrt(N)
-    hits = []
-    for k, (cm, cf) in res.items():
-        for i in np.where(np.abs(cf) > thr)[0]:
-            hits.append([[int(rest[q]) for q in cm[i]], float(cf[i])])
-    return dict(pair=list(pair), gate_coef=float(C[a, b]), hits=hits, N=int(N), n=int(n))
+def run(store, key, fn, quiet=False, **meta):
+    """Run fn() unless this key is already stored. fn returns a dict (folds, mean, sd, secs, ...);
+    meta labels the row. Fits that take 5 s or more print a progress line."""
+    if key in store.rows:
+        return store.rows[key]
+    row = fn()
+    row.update(key=key, **meta)
+    store.rows[key] = row
+    with open(store.path, "a") as f:
+        f.write(json.dumps(row) + "\n")
+    if not quiet and row.get("secs", 0) >= 5:  # only slow fits are announced
+        print(
+            f"{_label(key, meta):<64} {row['mean']:.3f} ± {row['sd']:.3f}  ({row.get('secs', 0)}s)"
+        )
+    return row
 
 
-def choose_bits(res, max_bits=14, mass_thr=0.02):
-    """Step 3: the gate pair plus the bits with the most mass."""
-    N, n, pair = res["N"], res["n"], res["pair"]
-    sq = np.sqrt(N)
-    mass = np.zeros(n)
-    for T, c in res["hits"]:
-        if abs(c) > 4.0 / sq:
-            for t in T:
-                mass[t] += c * c
-    ranked = [int(i) for i in np.argsort(-mass) if mass[i] > mass_thr and i not in pair]
-    return dict(
-        bits=sorted(pair + ranked[: max_bits - 2]),
-        pair=pair,
-        mass=[round(float(v), 5) for v in mass],
-        gate_z=abs(res["gate_coef"]) * sq,
-    )
+# ---- Bit selection: recursive feature elimination (Guyon et al., 2002) with a random forest
+def eliminate_bits(B, y):
+    """Fit a forest on the current bits, record its out-of-bag (OOB) accuracy, drop the bit with
+    the lowest importance, and repeat until one bit is left. Returns [[bits, OOB accuracy], ...]."""
+    cols, path = list(range(B.shape[1])), []
+    while cols:
+        rf = RandomForestClassifier(
+            G["RF_TREES"],
+            max_features=1.0,
+            min_samples_leaf=5,
+            oob_score=True,
+            n_jobs=-1,
+            random_state=SEED,
+        ).fit(B[:, cols], y)
+        path.append([list(cols), float(rf.oob_score_)])
+        cols.pop(int(np.argmin(rf.feature_importances_)))
+    return path
 
 
-_SCAN_PATH = f"{OUT}/scan_cache.json"
-_SCAN = json.load(open(_SCAN_PATH)) if os.path.exists(_SCAN_PATH) else {}
+def choose_bits(path, N):
+    """The smallest set of at most MAX_BITS bits whose OOB accuracy is within one standard error
+    of the best such set (the one-standard-error rule)."""
+    path = [(bits, a) for bits, a in path if len(bits) <= MAX_BITS]
+    best = max(a for _, a in path)
+    se = np.sqrt(best * (1 - best) / N)
+    return sorted(min((bits for bits, a in path if a >= best - se), key=len))
 
 
-def get_scan(B, y):
-    """scan_bits with an on-disk cache keyed by the content of (B, y), so the same training rows
-    are never scanned twice."""
-    key = (
-        hashlib.md5(np.ascontiguousarray(B).tobytes() + y.astype(np.int8).tobytes()).hexdigest()[
-            :16
-        ]
-        + f"|{B.shape[0]}x{B.shape[1]}|z{Z_FLOOR}"
-    )
-    if key not in _SCAN:
-        _SCAN[key] = scan_bits(B, y)
-        json.dump(_SCAN, open(_SCAN_PATH, "w"))
-    return _SCAN[key]
+def get_path(B, y):
+    """eliminate_bits, stored under a hash of the rows so the same rows are processed once."""
+    key = hashlib.md5(np.ascontiguousarray(B).tobytes() + y.astype(np.int8).tobytes()).hexdigest()
+
+    def job():
+        t0 = time.time()
+        return dict(path=eliminate_bits(B, y), mean=0.0, sd=0.0, secs=round(time.time() - t0, 1))
+
+    return run(SEL, key, job, quiet=True, exp="ELIM", n=B.shape[1], rows=len(y))["path"]
+
+
+def fold_paths(n):
+    """The elimination path on the training rows of every fold."""
+    X, B, y = load(n)
+    return [get_path(B[tr], y[tr]) for tr, _ in FOLDS[n]]
 
 
 class BitModel:
-    """Wraps any estimator: scan and select on the rows it is fitted on, then fit the estimator on
-    those columns only. If nothing is selected it predicts the training majority class."""
+    """Wraps any estimator: eliminate bits on the rows it is fitted on, then fit the estimator on
+    the bits kept. other=True is a control: it uses as many bits drawn at random from the
+    eliminated ones."""
 
-    def __init__(self, base):
-        self.base = base
+    def __init__(self, base, other=False):
+        self.base, self.other = base, other
 
     def fit(self, B, y):
-        self.scan_ = get_scan(B, y)
-        sel = choose_bits(self.scan_)
-        self.cols_, self.pair_, self.mass_, self.gate_z_ = (
-            sel["bits"],
-            sel["pair"],
-            sel["mass"],
-            sel["gate_z"],
-        )
-        self.const_ = None if self.cols_ else int(y.mean() >= 0.5)
-        if self.cols_:
-            self.base.fit(B[:, self.cols_], y)
+        self.cols_ = choose_bits(get_path(B, y), len(y))
+        rest = [i for i in range(B.shape[1]) if i not in self.cols_]
+        if self.other and rest:
+            k = min(len(self.cols_), len(rest))
+            self.cols_ = sorted(np.random.default_rng(SEED).choice(rest, k, replace=False).tolist())
+        self.base.fit(B[:, self.cols_], y)
         return self
 
     def predict(self, B):
-        return (
-            np.full(len(B), self.const_)
-            if self.const_ is not None
-            else self.base.predict(B[:, self.cols_])
-        )
+        return self.base.predict(B[:, self.cols_])
 
 
-def _brute_bits(B, y, maxdeg=4, mass_thr=0.02, max_bits=14):
-    """A plain loop over all subsets: a slow reference implementation to test scan_bits against."""
-    N, n = B.shape
-    s = 2.0 * y - 1
-    C = (B * s[:, None]).T @ B / N
-    np.fill_diagonal(C, 0.0)
-    a, b = np.unravel_index(np.argmax(np.abs(C)), C.shape)
-    pair = (int(min(a, b)), int(max(a, b)))
-    z = (s * B[:, pair[0]] * B[:, pair[1]]).astype(np.float32)
-    rest = [i for i in range(n) if i not in pair]
-    mass, thr = np.zeros(n), 4.0 / np.sqrt(N)
-    for k in range(1, maxdeg + 1):
-        for c in itertools.combinations(rest, k):
-            coef = float((z * np.prod(B[:, list(c)], axis=1)).mean())
-            if abs(coef) > thr:
-                for t in c:
-                    mass[t] += coef**2
-    ranked = [int(i) for i in np.argsort(-mass) if mass[i] > mass_thr and i not in pair]
-    return sorted(list(pair) + ranked[: max_bits - 2]), mass
-
-
-def self_test():
-    """The fast scan agrees with the plain loop on a planted example, and a label that is one pair
-    gives exactly that pair."""
-    rng = np.random.default_rng(1)
-    n, N = 12, 700
-    B = rng.choice([-1.0, 1.0], (N, n)).astype(np.float32)
-    f = (
-        B[:, 0] * B[:, 1] * B[:, 2]
-        + 0.8 * B[:, 0] * B[:, 1] * B[:, 5] * B[:, 6]
-        + 0.6 * B[:, 0] * B[:, 1]
-    )
-    y = ((f + rng.normal(0, 0.3, N)) > 0).astype(int)
-    bits_ref, mass_ref = _brute_bits(B, y)
-    res = scan_bits(B, y)
-    assert choose_bits(res)["bits"] == bits_ref, "fast scan disagrees with the plain loop"
-    assert (
-        np.abs(np.array(choose_bits(res)["mass"]) - mass_ref).max() < 1e-4
-    ), "mass differs from the plain loop"
-    assert set(res["pair"]) == {0, 1} and {0, 1, 2, 5, 6} <= set(
-        bits_ref
-    ), "planted gate terms not found"
-    B2 = np.random.default_rng(2).choice([-1.0, 1.0], (7680, 20)).astype(np.float32)
-    y2 = ((B2[:, 3] * B2[:, 5] > 0) ^ (np.random.default_rng(3).random(7680) < 0.03)).astype(int)
-    r2 = scan_bits(B2, y2)
-    assert r2["pair"] == [3, 5] and choose_bits(r2)["bits"] == [3, 5]
-    print("selector tests passed")
-
-
+# ---- Models
 # penalty= is deprecated since scikit-learn 1.8 in favour of l1_ratio=
 NEW_SKLEARN = tuple(int(v) for v in sklearn.__version__.split(".")[:2]) >= (1, 8)
 
@@ -481,23 +362,6 @@ class KernelPolyLR:
         return (self.decision_function(B) > 0).astype(np.int64)
 
 
-class FullPolyLR:
-    """Logistic regression on all 2^k - 1 products of distinct bits of its k input columns (a
-    polynomial of degree k, so any function of those k bits). Meant for small k: it runs behind
-    the bit selector, which keeps k <= 14."""
-
-    def __init__(self, pen, C):
-        self.pen, self.C = pen, C
-
-    def fit(self, B, y):
-        self.pf_ = PolynomialFeatures(B.shape[1], interaction_only=True, include_bias=False).fit(B)
-        self.lr_ = lr_clf(self.pen, self.C).fit(self.pf_.transform(B), y)
-        return self
-
-    def predict(self, B):
-        return self.lr_.predict(self.pf_.transform(B))
-
-
 class PaperBaseline:
     """The mock paper's model: PolynomialFeatures(2) on the raw inputs, logistic regression, C =
     0.85."""
@@ -532,23 +396,6 @@ class KMeansMajority:
         return self.vote_[self.km_.predict(B)]
 
 
-class KMeansOneHot:
-    """The one-hot cluster id is the only input of a logistic regression."""
-
-    def __init__(self, k):
-        self.k = k
-
-    def fit(self, B, y):
-        self.km_ = KMeans(self.k, n_init=3, max_iter=100, random_state=SEED).fit(B)
-        self.lr_ = LogisticRegression(C=1.0, max_iter=300).fit(
-            np.eye(self.k, dtype=np.float32)[self.km_.labels_], y
-        )
-        return self
-
-    def predict(self, B):
-        return self.lr_.predict(np.eye(self.k, dtype=np.float32)[self.km_.predict(B)])
-
-
 def lr_clf(pen, C):
     if pen == "l2":
         return LogisticRegression(C=C, max_iter=300)
@@ -562,19 +409,17 @@ def lr_clf(pen, C):
 
 
 def make_estimator(family, p, cond="all"):
-    """Build any model. p: JSON-friendly hyper-parameters. cond: 'all' bits, or 'sel' = the bit
-    selector runs inside fit()."""
-    if family in ("lr_l1", "lr_l2"):
+    """Build any model. p: JSON-friendly hyper-parameters. cond: 'all' bits; 'sel' = the bit
+    elimination runs inside fit(); 'other' = the control on eliminated bits."""
+    if family in ("lr_l1", "lr_l2"):  # LR on all products of up to deg distinct bits
         est = Pipeline(
             [
                 ("poly", PolynomialFeatures(p["deg"], interaction_only=True, include_bias=False)),
                 ("lr", lr_clf(family[-2:], p["C"])),
             ]
         )
-    elif family == "dtree":
-        est = DecisionTreeClassifier(
-            max_depth=p["max_depth"], min_samples_leaf=p["msl"], random_state=SEED
-        )
+    elif family == "kpoly":
+        est = KernelPolyLR(p["deg"], p["C"])
     elif family == "rf":
         est = RandomForestClassifier(
             G["RF_TREES"],
@@ -583,48 +428,22 @@ def make_estimator(family, p, cond="all"):
             n_jobs=-1,
             random_state=SEED,
         )
-    elif family == "hgb":
-        est = HistGradientBoostingClassifier(
-            max_depth=p["max_depth"],
-            max_iter=300,
-            learning_rate=0.1,
-            early_stopping=True,
-            random_state=SEED,
-        )
+    elif family == "kmeans":
+        est = KMeansMajority(p["k"])
     elif family == "mlp":
         est = MLPClassifier(
             tuple(p["h"]),
-            alpha=p["alpha"],
+            alpha=G["MLP_ALPHA"],
             early_stopping=True,
             n_iter_no_change=G["MLP_PATIENCE"],
             max_iter=G["MLP_MAXITER"],
             random_state=SEED,
         )
-    elif family == "kmeans_major":
-        est = KMeansMajority(p["k"])
-    elif family == "kmeans_onehot":
-        est = KMeansOneHot(p["k"])
-    elif family == "lrfull":
-        est = FullPolyLR(p["pen"], p["C"])
-    elif family == "kpoly":
-        est = KernelPolyLR(p["deg"], p["C"])
     elif family == "paper":
         est = PaperBaseline()
     else:
         raise ValueError(family)
-    return BitModel(est) if cond == "sel" else est
-
-
-def kryptonet_sized():
-    """The 4 x 512 MLP (KryptoNet's shape), with a capped training budget."""
-    return MLPClassifier(
-        (512, 512, 512, 512),
-        alpha=G["MLP_ALPHA"][0],
-        early_stopping=True,
-        n_iter_no_change=G["KN_PATIENCE"],
-        max_iter=G["KN_MAXITER"],
-        random_state=SEED,
-    )
+    return est if cond == "all" else BitModel(est, other=cond == "other")
 
 
 def test_kernel():
@@ -657,57 +476,18 @@ def test_kernel():
     print("kernel tests passed")
 
 
-class Store:
-    def __init__(self, name):
-        self.path, self.rows = f"{OUT}/{name}.jsonl", {}
-        if os.path.exists(self.path):
-            for line in open(self.path):
-                r = json.loads(line)
-                self.rows[r["key"]] = r
-
-    def where(self, **kw):
-        return [r for r in self.rows.values() if all(r.get(k) == v for k, v in kw.items())]
-
-
-CV, LC, NUL, FIN = (Store(nm) for nm in ("cv_results", "learning_curves", "selector_null", "final"))
-
-
-def _label(key, meta):
-    """Short description of a result for the progress line."""
-    if "family" not in meta:
-        return key
-    parts = [meta["exp"], f"n={meta['n']}", meta["sub"], show_params(meta.get("params"))]
-    return " ".join(str(p) for p in parts if p)
-
-
-def run(store, key, fn, quiet=False, **meta):
-    """Run fn() unless this key is already stored. fn returns a dict (folds, mean, sd, secs, ...);
-    meta labels the row. Fits that take 5 s or more print a progress line."""
-    if key in store.rows:
-        return store.rows[key]
-    row = fn()
-    row.update(key=key, **meta)
-    store.rows[key] = row
-    with open(store.path, "a") as f:
-        f.write(json.dumps(row) + "\n")
-    if not quiet and row.get("secs", 0) >= 5:  # only slow fits are announced
-        print(
-            f"{_label(key, meta):<64} {row['mean']:.3f} ± {row['sd']:.3f}  ({row.get('secs', 0)}s)"
-        )
-    return row
-
-
+# ---- Cross-validation and comparisons
 def acc(m, X, y):
     return float((m.predict(X) == y).mean())
 
 
-def cv_eval(make, n, fam="", size=None, folds=None, post=None, shuffle_labels=False):
+def cv_eval(make, n, fam="", size=None, folds=None, shuffle_labels=False):
     """K-fold CV on dev: fit make() on the training folds, score on the held-out fold, so models
     can be compared fold by fold. size: use only that many training rows (a fixed random subset
     of each fold-train set)."""
     X, B, y = load(n)
     M = X if fam == "paper" else B
-    t0, accs, trs, posts = time.time(), [], [], []
+    t0, accs, trs = time.time(), [], []
     for f, (tr, va) in enumerate(FOLDS[n]):
         if folds is not None and f not in folds:
             continue
@@ -717,25 +497,22 @@ def cv_eval(make, n, fam="", size=None, folds=None, post=None, shuffle_labels=Fa
         est = make().fit(M[tr], ytr)
         accs.append(acc(est, M[va], y[va]))
         trs.append(acc(est, M[tr], ytr))
-        if post:
-            posts.append(post(est))
     return dict(
         folds=[round(a, 5) for a in accs],
         mean=float(np.mean(accs)),
         sd=float(np.std(accs, ddof=1)) if len(accs) > 1 else 0.0,
         train=float(np.mean(trs)),
         secs=round(time.time() - t0, 1),
-        post=posts,
     )
 
 
-def cv_config(n, exp, family, cond, sub, p, post=None, **kw):
+def cv_config(n, exp, family, cond, sub, p, **kw):
     """Cross-validate one model setting, unless it is already stored."""
     key = f"{exp}|{n}|{family}|{cond}|{sub}|{json.dumps(p, sort_keys=True)}"
     return run(
         CV,
         key,
-        lambda: cv_eval(lambda: make_estimator(family, p, cond), n, fam=family, post=post, **kw),
+        lambda: cv_eval(lambda: make_estimator(family, p, cond), n, fam=family, **kw),
         exp=exp,
         n=n,
         family=family,
@@ -743,6 +520,35 @@ def cv_config(n, exp, family, cond, sub, p, post=None, **kw):
         sub=sub,
         params=p,
     )
+
+
+def cv_by_fold(n, family, p, sub):
+    """Like cv_config for a slow model: every fold is stored when it finishes, then combined."""
+    key = f"{family}|{n}|{sub}|{json.dumps(p, sort_keys=True)}"
+    meta = dict(n=n, family=family, cond="all", params=p)
+    parts = [
+        run(
+            CV,
+            f"{key}|fold{f}",
+            lambda: cv_eval(lambda: make_estimator(family, p), n, folds=(f,)),
+            exp="FOLD",
+            sub=f"{sub}, fold {f + 1}",
+            **meta,
+        )
+        for f in range(K)
+    ]
+
+    def combine():
+        a = [r["folds"][0] for r in parts]
+        return dict(
+            folds=a,
+            mean=float(np.mean(a)),
+            sd=float(np.std(a, ddof=1)),
+            train=float(np.mean([r["train"] for r in parts])),
+            secs=0.0,
+        )
+
+    return run(CV, key, combine, quiet=True, exp="MLP", sub=sub, **meta)
 
 
 def groups(n):
@@ -758,44 +564,17 @@ def groups(n):
     )
 
 
-def paired(a, b):
-    """Paired fold differences a - b: mean, sd, Nadeau-Bengio standard error and 95% t interval.
-    Folds share training rows, so the naive se sd/sqrt(k) is too small; the correction replaces
-    1/k by 1/k + n_val/n_train."""
+def difference(a, b):
+    """Fold-by-fold accuracy difference a - b on the same folds: '+0.283 ± 0.012 (5 of 5)', the
+    mean ± sd over folds and the number of folds where a is better."""
     d = np.asarray(a) - np.asarray(b)
-    k = len(d)
-    sd = d.std(ddof=1)
-    se = sd * np.sqrt(1 / k + 1 / (K - 1))
-    t = stats.t.ppf(0.975, k - 1)
-    return dict(
-        mean=float(d.mean()),
-        sd=float(sd),
-        se=float(se),
-        lo=float(d.mean() - t * se),
-        hi=float(d.mean() + t * se),
-        wins=int((d > 0).sum()),
-        k=k,
-    )
+    return f"{d.mean():+.3f} ± {d.std(ddof=1):.3f} ({int((d > 0).sum())} of {len(d)})"
 
 
-def wilson_half(p, N, z=1.96):
-    return float(z * np.sqrt(p * (1 - p) / N + z * z / (4 * N * N)) / (1 + z * z / N))
-
-
-def interval(p):
-    """'+0.107 [±0.041]': the mean and the half-width of the 95% interval from paired()."""
-    return f"{p['mean']:+.3f} [±{(p['hi'] - p['lo']) / 2:.3f}]"
-
-
-def lr_post(m):
-    coef = m.named_steps["lr"].coef_
-    return dict(nnz=int((coef != 0).sum()), n_feats=int(coef.shape[1]))
-
-
-def sel_post(m):
-    return dict(
-        bits=[int(b) for b in m.cols_], pair=m.pair_, gate_z=float(m.gate_z_), n_sel=len(m.cols_)
-    )
+def binomial_half(p, N, z=1.96):
+    """Half-width of the 95% interval of an accuracy p measured on N independent test rows: each
+    row is right or wrong, so the count of correct rows is binomial with sd sqrt(p (1 - p) / N)."""
+    return float(z * np.sqrt(p * (1 - p) / N))
 
 
 def jaccard_mean(sets):
@@ -804,29 +583,13 @@ def jaccard_mean(sets):
     return float(np.mean(v)) if v else float("nan")
 
 
-GENERIC = ("paper", "lr_l2", "lr_l1", "dtree", "rf", "hgb", "kmeans_major", "kmeans_onehot", "mlp")
-
-
-def best_generic(n):
-    """The best setting of each family on all bits."""
-    out = []
-    for fam in GENERIC:
-        gs = [g for g in groups(n) if g["key"][0] == fam and g["key"][1] == "all"]
-        if gs:
-            out.append(max(gs, key=lambda g: g["best"]["mean"]))
-    return out
-
-
-def top_generic(n):
-    """The best generic model; the paper baseline is a reference, not a candidate."""
-    return max(
-        (g for g in best_generic(n) if g["key"][0] != "paper"), key=lambda g: g["best"]["mean"]
+def best_of(n, cond, fams=("lr_l1", "lr_l2"), sub=None):
+    """The CV-best group among these families on these bits (optionally one sub-model)."""
+    return next(
+        g
+        for g in groups(n)
+        if g["key"][0] in fams and g["key"][1] == cond and sub in (None, g["key"][2])
     )
-
-
-def sel_best(n, family="rf"):
-    """The best setting of a model on the selected bits."""
-    return [g for g in groups(n) if g["key"] == (family, "sel", family)][0]["best"]
 
 
 # ---- Tables: plain text, one column per n
@@ -866,167 +629,145 @@ def ms(r):
     return f"{r['mean']:.3f} ± {r['sd']:.3f}"
 
 
-def table_degree():
-    """Paper baseline, the best explicit polynomial LR, and the kernel LR at degree 10, n and 2n."""
-    rows = [["Paper baseline (quadratic LR)"] + [ms(CV.where(n=n, family="paper")[0]) for n in NS]]
-    best = {
-        n: max(
-            (g for g in groups(n) if g["key"][0] in ("lr_l1", "lr_l2")),
-            key=lambda g: g["best"]["mean"],
+def _mean_sd(n, cond, fams, sub=None):
+    """'0.675 ± 0.017' for the best such model, or '-' if it was not run."""
+    try:
+        return ms(best_of(n, cond, fams, sub)["best"])
+    except StopIteration:
+        return "-"
+
+
+def kernel_label(i):
+    """Name of the i-th kernel degree: a number, or 'n' / '2n' when it differs between datasets."""
+    degs = [G["KP_DEGS"][n][i] for n in NS]
+    return str(degs[0]) if len(set(degs)) == 1 else ("n" if degs[0] == NS[0] else "2n")
+
+
+def table_degree_all():
+    """Polynomial LR on all bits by degree: explicit monomials, then the paper's kernel."""
+    blank = [""] * (len(NS) + 1)
+    rows = [["Explicit monomials (best penalty and C per degree)"] + [""] * len(NS)]
+    for d in range(1, max(G["MAX_DEG"].values()) + 1):
+        rows.append(
+            [f"    degree {d}"] + [_mean_sd(n, "all", ("lr_l1", "lr_l2"), f"deg{d}") for n in NS]
         )
-        for n in NS
-    }
-    rows += [["Best explicit LR (degree up to 4 / 3 / 2)"] + [ms(best[n]["best"]) for n in NS]]
-    rows += [
-        ["    which"] + [f"{NAME[best[n]['key'][0]]}, degree {best[n]['key'][2][3:]}" for n in NS]
+    rows += [blank, [f"The paper's kernel (C = {G['KP_C']})"] + [""] * len(NS)]
+    last = len(G["KP_DEGS"][NS[0]]) - 1
+    for i in range(last + 1):
+        subs = {n: f"deg{G['KP_DEGS'][n][i]}" for n in NS}
+        rows.append(
+            [f"    degree {kernel_label(i)}"]
+            + [_mean_sd(n, "all", ("kpoly",), subs[n]) for n in NS]
+        )
+    train = [
+        best_of(n, "all", ("kpoly",), f"deg{G['KP_DEGS'][n][last]}")["best"]["train"] for n in NS
     ]
-    for i, label in enumerate(("10", "n", "2n")[: len(G["KP_DEGS"][NS[0]])]):
-        rs = [CV.where(n=n, family="kpoly", sub=f"deg{G['KP_DEGS'][n][i]}")[0] for n in NS]
-        rows += [
-            [f"Kernel LR, degree {label}"] + [ms(r) for r in rs],
-            ["    train accuracy"] + [f"{r['train']:.3f}" for r in rs],
-        ]
-    grid("Cross-validated accuracy (mean ± sd over folds)", rows)
-
-
-def table_kernel_c():
-    """Held-out accuracy of the kernel LR at degree n on fold 0, for several C."""
-    rows = []
-    for C in (0.1, G["KP_C"], 10, 1000):
-        cells = []
-        for n in NS:
-            r = [
-                r
-                for r in CV.where(n=n, family="kpoly")
-                if r["params"]["C"] == C
-                and r["params"]["deg"] == n
-                and (r["exp"] == "KPOLYC" or C == G["KP_C"])
-            ]
-            cells.append(f"{r[0]['folds'][0]:.3f}" if r else "")
-        rows.append([f"C = {C:g}" + (" (the paper's)" if C == G["KP_C"] else "")] + cells)
-    grid("Kernel LR at degree n, fold 0 only: held-out accuracy by C", rows)
+    rows.append(
+        [f"        training accuracy at degree {kernel_label(last)}"] + [f"{t:.3f}" for t in train]
+    )
+    grid(
+        "Polynomial LR on all bits: CV accuracy by degree (mean ± sd over folds)",
+        rows,
+        "- : not run, too many monomials to fit in memory.",
+    )
 
 
 def table_families():
-    """The best setting of every model family on all bits, by CV."""
-    best = {n: {g["key"][0]: g for g in best_generic(n)} for n in NS}
+    """The best setting of every other model family on all bits."""
     rows = [
-        [NAME[f]] + [ms(best[n][f]["best"]) for n in NS]
-        for f in ("dtree", "rf", "hgb", "kmeans_major", "kmeans_onehot", "mlp")
+        ["K-means (cluster majority)"] + [_mean_sd(n, "all", ("kmeans",)) for n in NS],
+        ["Random forest"] + [_mean_sd(n, "all", ("rf",)) for n in NS],
+        ["MLP 4×512"] + [_mean_sd(n, "all", ("mlp",)) for n in NS],
+        ["Best polynomial LR, for reference"]
+        + [_mean_sd(n, "all", ("lr_l1", "lr_l2", "kpoly")) for n in NS],
     ]
-    kn = {r["n"]: r for r in CV.rows.values() if r["sub"].startswith("4x512")}
-    if kn:
-        rows += [["MLP 4×512, fold 0 only"] + [f"{kn[n]['folds'][0]:.3f}" for n in NS]]
-        same = [best[n]["mlp"]["best"]["folds"][0] for n in NS]
-        rows += [["    MLP 2×128, same fold"] + [f"{v:.3f}" for v in same]]
-    grid(
-        "Cross-validated accuracy on all bits (mean ± sd over folds, best setting of each family)",
-        rows,
-    )
-
-
-def table_selector():
-    """What the selector picks on the real labels and on shuffled labels."""
-    post = {n: sel_best(n)["post"] for n in NS}
-    rows = [
-        ["Bits selected (mean over folds)"]
-        + [f"{np.mean([p['n_sel'] for p in post[n]]):.1f}" for n in NS],
-        ["Overlap of the bits between folds (Jaccard)"]
-        + [f"{jaccard_mean([p['bits'] for p in post[n]]):.2f}" for n in NS],
-        ["Gate z-score (mean)"] + [f"{np.mean([p['gate_z'] for p in post[n]]):.1f}" for n in NS],
-        ["Bits selected on shuffled labels"]
-        + [f"{np.mean([r['n_sel'] for r in NUL.where(n=n)]):.1f}" for n in NS],
-    ]
-    grid(
-        "Bit selector",
-        rows,
-        "2 bits on shuffled labels = the gate pair alone, so no false bit is added.",
-    )
-
-
-def table_selected():
-    """Models on the selected bits against the best model on all bits."""
-    f, p, top = {}, {}, {}
+    grid("Other models on all bits: CV accuracy (mean ± sd over folds, best setting)", rows)
     for n in NS:
-        f[n], p[n], top[n] = sel_best(n), sel_best(n, "lrfull"), top_generic(n)
+        g = best_of(n, "all", ("rf",))
+        print(f"n = {n}: best forest has {show_params(g['best']['params'])}")
+
+
+def table_elimination():
+    """What the elimination keeps in every fold, and the OOB accuracy around the kept set."""
+    paths = {n: fold_paths(n) for n in NS}
+    kept = {n: [choose_bits(p, FOLD_TRAIN[n]) for p in paths[n]] for n in NS}
+
+    def oob(n, size):
+        """Mean OOB accuracy over folds of the set with size(kept) bits."""
+        vals = []
+        for p, k in zip(paths[n], kept[n]):
+            vals += [a for bits, a in p if len(bits) == size(k)]
+        return f"{np.mean(vals):.3f}" if vals else "-"
+
     rows = [
-        ["Forest on the selected bits"] + [ms(f[n]) for n in NS],
-        ["LR on all monomials of the selected bits"] + [ms(p[n]) for n in NS],
-        ["Best model on all bits"]
-        + [f"{top[n]['best']['mean']:.3f} ({SHORT[top[n]['key'][0]]})" for n in NS],
-        ["Forest minus best on all bits"]
-        + [interval(paired(f[n]["folds"], top[n]["best"]["folds"])) for n in NS],
-        ["LR minus forest (same bits)"]
-        + [interval(paired(p[n]["folds"], f[n]["folds"])) for n in NS],
+        ["Bits kept (mean over folds)"] + [f"{np.mean([len(k) for k in kept[n]]):.1f}" for n in NS],
+        ["Overlap of the kept bits between folds (Jaccard)"]
+        + [f"{jaccard_mean(kept[n]):.2f}" for n in NS],
+        ["OOB accuracy with all bits"] + [oob(n, lambda k, n=n: n) for n in NS],
+        ["OOB accuracy with the kept bits"] + [oob(n, len) for n in NS],
+        ["OOB accuracy with one bit fewer"] + [oob(n, lambda k: len(k) - 1) for n in NS],
     ]
-    grid(
-        "Cross-validated accuracy (mean ± sd over folds)",
-        rows,
-        "[±x] is the half-width of the 95% interval of the paired fold differences; an interval"
-        " around 0 means\nthe two models cannot be told apart.",
+    grid("Recursive elimination of bits with a random forest (training rows of each fold)", rows)
+
+
+def table_degree_sel():
+    """Polynomial LR on the selected bits by degree."""
+    rows = [
+        [f"degree {d}"] + [_mean_sd(n, "sel", ("lr_l2",), f"deg{d}") for n in NS]
+        for d in G["SEL_DEGS"]
+    ]
+    grid("Polynomial LR on the selected bits: CV accuracy by degree (mean ± sd over folds)", rows)
+
+
+def summary_rows(final):
+    """The rows of the summary table: ('group', title) and ('row', label, one value per n), plus
+    the footnote."""
+
+    def top(cond, fams, sub=None):
+        return [best_of(n, cond, fams, sub)["best"]["mean"] for n in NS]
+
+    degs = " / ".join(str(G["MAX_DEG"][n]) for n in NS)
+    last = kernel_label(len(G["KP_DEGS"][NS[0]]) - 1)
+    rows = [
+        ("group", "Polynomial LR on all bits (the paper's approach)"),
+        ("row", "Paper baseline (degree 2)", top("all", ("paper",))),
+        ("row", f"Explicit monomials, best degree up to {degs}", top("all", ("lr_l1", "lr_l2"))),
+        ("row", f"Paper's kernel, best degree up to {last}", top("all", ("kpoly",))),
+        ("group", "Other models on all bits"),
+        ("row", "K-means", top("all", ("kmeans",))),
+        ("row", "Random forest", top("all", ("rf",))),
+    ]
+    if all(CV.where(n=n, family="mlp", exp="MLP") for n in NS):
+        rows.append(("row", NAME["mlp"], top("all", ("mlp",))))
+    rows.append(("group", "Polynomial LR on the selected bits (forest elimination)"))
+    for d in [d for d in (2, 4, 6, 10) if d in G["SEL_DEGS"]]:
+        rows.append(("row", f"Degree {d}", top("sel", ("lr_l2",), f"deg{d}")))
+    rows += [
+        ("group", "Final pipeline on the locked test rows"),
+        ("row", "Locked test accuracy", [locked_score(final, n)["mean"] for n in NS]),
+    ]
+    note = (
+        f"{K}-fold CV on the dev rows; the bits are selected inside each fold. A coin flip is 0.50."
     )
+    return rows, [note]
 
 
 def table_summary(final):
-    """One row per approach with its best setting's accuracy, grouped by what the approach uses."""
-    best = {n: {g["key"][0]: g["best"] for g in best_generic(n)} for n in NS}
-    kn = {r["n"]: r for r in CV.rows.values() if r["sub"].startswith("4x512")}
-    sel = {n: (sel_best(n), sel_best(n, "lrfull")) for n in NS}
-    k_sel = sorted({round(np.mean([p["n_sel"] for p in sel[n][0]["post"]])) for n in NS})
-
-    def row(label, vals):
-        return ["    " + label] + [f"{v:.3f}" for v in vals]
-
-    def top(*fams):
-        return [max(best[n][f]["mean"] for f in fams) for n in NS]
-
-    degs = " / ".join(str(G["MAX_DEG"][n]) for n in NS)
-    blank = [""] * (len(NS) + 1)
-    rows = [
-        ["The paper's approach: polynomials on all bits"] + [""] * len(NS),
-        row("Quadratic LR (the paper's baseline)", [best[n]["paper"]["mean"] for n in NS]),
-        row(f"LR on all monomials up to degree {degs}", top("lr_l1", "lr_l2")),
-        row(
-            "Kernel LR at degree n",
-            [CV.where(n=n, family="kpoly", sub=f"deg{n}")[0]["mean"] for n in NS],
-        ),
-        blank,
-        ["Other models on all bits"] + [""] * len(NS),
-        row("K-means", top("kmeans_major", "kmeans_onehot")),
-        row("Trees (best of tree, forest, boosting)", top("dtree", "rf", "hgb")),
-        row("MLP 2×128", top("mlp")),
-    ]
-    if kn:
-        rows += [row("MLP 4×512, fold 0 only †", [kn[n]["folds"][0] for n in NS])]
-    bits = "/".join(map(str, k_sel))
-    rows += [
-        blank,
-        [f"After selecting {bits} bits inside each fold"] + [""] * len(NS),
-        row("Random forest on the selected bits", [sel[n][0]["mean"] for n in NS]),
-        row("LR on all monomials of the selected bits", [sel[n][1]["mean"] for n in NS]),
-        blank,
-        ["Final pipeline, scored once on the locked test rows"] + [""] * len(NS),
-        row("Locked test accuracy", [locked_score(final, n)["mean"] for n in NS]),
-    ]
-    note = (
-        f"{K}-fold CV on the dev rows, mean of each approach's best setting; a coin flip is 0.50."
-    )
-    if kn:
-
-        def fold0(vals):
-            return " / ".join(f"{v:.3f}" for v in vals)
-
-        same_fold = fold0([best[n]["mlp"]["folds"][0] for n in NS])
-        forest_fold = fold0([sel[n][0]["folds"][0] for n in NS])
-        note += (
-            f"\n† Fold 0 only. On that fold MLP 2×128 scores {same_fold},"
-            f"\n  and the forest on the selected bits {forest_fold}."
-        )
-    grid("Summary: accuracy of each approach", rows, note)
+    """The summary as plain text."""
+    rows, notes = summary_rows(final)
+    out = []
+    for r in rows:
+        if r[0] == "group":
+            if out:
+                out.append([""] * (len(NS) + 1))
+            out.append([r[1]] + [""] * len(NS))
+        else:
+            out.append(["    " + r[1]] + [f"{v:.3f}" for v in r[2]])
+    grid("Summary: accuracy of each approach", out, "\n".join(notes))
 
 
 def table_final(final):
-    """Cross-validation and locked-test accuracy of the final pipeline."""
+    """The final pipeline: CV, locked test, the two controls and the paired comparisons."""
     for n in NS:
         print(f"n = {n}: {kname(final[n]['key'])} ({show_params(final[n]['best']['params'])})")
     lk = {n: locked_score(final, n) for n in NS}
@@ -1038,11 +779,31 @@ def table_final(final):
             f"[{lk[n]['mean'] - lk[n]['half']:.3f}, {lk[n]['mean'] + lk[n]['half']:.3f}]"
             for n in NS
         ],
-        ["Shuffled-label control (should be 0.5)"]
+        ["Control: shuffled training labels"]
         + [f"{FIN.rows[f'shuffle|{n}']['mean']:.3f}" for n in NS],
+        ["Control: same model on eliminated bits"]
+        + [
+            f"{FIN.rows[f'other|{n}']['mean']:.3f}" if f"other|{n}" in FIN.rows else "-" for n in NS
+        ],
     ]
+    others = [
+        ("Final minus best explicit LR on all bits", lambda n: best_of(n, "all")),
+        ("Final minus random forest on all bits", lambda n: best_of(n, "all", ("rf",))),
+    ]
+    if all(CV.where(n=n, family="mlp", exp="MLP") for n in NS):
+        others.append(("Final minus MLP 4×512", lambda n: best_of(n, "all", ("mlp",))))
+    for label, other in others:
+        rows.append(
+            [label] + [difference(final[n]["best"]["folds"], other(n)["best"]["folds"]) for n in NS]
+        )
     print()
-    grid("Final pipeline", rows)
+    grid(
+        "Final pipeline",
+        rows,
+        "Both controls should be about 0.5. Differences: mean ± sd over the folds (folds where the"
+        "\nfinal pipeline is better). The folds share training rows, so the sd understates the"
+        "\nuncertainty; the locked test is the independent check.",
+    )
 
 
 # ---- Figures: drawn at their size in the report (one column 3.25 in, page width 6.75 in)
@@ -1067,33 +828,15 @@ plt.rcParams.update(
         "savefig.bbox": "tight",
     }
 )
-BLUE, ORANGE, AQUA, YELLOW, MAGENTA, GREEN, VIOLET, INK, GRAY = (
+BLUE, ORANGE, AQUA, VIOLET, MAGENTA, INK, GRAY = (
     "#2a78d6",
     "#eb6834",
     "#1baf7a",
-    "#eda100",
-    "#e87ba4",
-    "#008300",
     "#6250d6",
+    "#e87ba4",
     "#52514e",
     "#9a9892",
 )
-# Colour follows the model family and every family has its own marker, so nothing depends on colour
-# alone.
-COL = dict(
-    lr_l2=BLUE,
-    lr_l1=ORANGE,
-    kpoly=VIOLET,
-    lrfull=VIOLET,
-    dtree=YELLOW,
-    rf=AQUA,
-    hgb=GREEN,
-    mlp=MAGENTA,
-    kmeans_major=GRAY,
-    kmeans_onehot=INK,
-    paper=GRAY,
-)
-MK = dict(lr_l2="o", lr_l1="s", kpoly="D")
 
 
 def savefig(fig, name):
@@ -1101,130 +844,125 @@ def savefig(fig, name):
     plt.show()
 
 
+def fig_summary_table(final):
+    """The summary as a typeset table (rules, groups, best CV mean per column in bold)."""
+    rows, notes = summary_rows(final)
+    width, step, right = 6.2, 0.27, (0.72, 0.86, 1.0)
+    bottom = len(rows) + 1.0 + 0.75 * (len(notes) - 1) + 0.6
+    fig, ax = plt.subplots(figsize=(width, (bottom + 0.7) * step))
+    ax.axis("off")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(bottom, -0.7)
+    ax.grid(False)
+    group_of = []
+    for i, r in enumerate(rows):
+        group_of.append(i if r[0] == "group" else group_of[-1])
+    counted = [i for i, r in enumerate(rows) if r[0] == "row" and group_of[i] != max(group_of)]
+    top = [max(rows[i][2][c] for i in counted) for c in range(len(NS))]
+
+    def rule(y, lw):
+        ax.plot([0, 1], [y, y], color=INK, lw=lw, solid_capstyle="butt", clip_on=False)
+
+    for i, g in enumerate(group_of, start=1):  # tint the models that use the selected bits
+        if "selected bits" in rows[g][1]:
+            ax.axhspan(i - 0.5, i + 0.5, color=VIOLET, alpha=0.1, lw=0)
+    rule(-0.5, 1.2)
+    for c, n in enumerate(NS):
+        ax.text(right[c], 0, f"n = {n}", ha="right", va="center", fontweight="bold", color=INK)
+    rule(0.5, 0.6)
+    for i, r in enumerate(rows, start=1):
+        if r[0] == "group":
+            if i > 1:
+                rule(i - 0.5, 0.3)
+            ax.text(0, i, r[1], va="center", fontweight="bold", color=INK)
+            continue
+        ax.text(0.03, i, r[1], va="center", color=INK)
+        for c, v in enumerate(r[2]):
+            weight = "bold" if i - 1 in counted and v == top[c] else "normal"
+            ax.text(right[c], i, f"{v:.3f}", ha="right", va="center", color=INK, fontweight=weight)
+    rule(len(rows) + 0.5, 1.2)
+    for j, line in enumerate(notes):
+        ax.text(0, len(rows) + 1.0 + 0.75 * j, line, va="center", fontsize=8, color=GRAY)
+    savefig(fig, "table_summary")
+
+
 def fig_degree():
-    """Accuracy against polynomial degree: explicit LR (degree 1-4), the paper's kernel (degree 10,
-    n, 2n), paper baseline."""
-    fig, axes = plt.subplots(1, 3, figsize=(6.75, 2.7), sharey=True, layout="constrained")
+    """CV accuracy against the polynomial degree: explicit monomials and the paper's kernel on all
+    bits, explicit monomials on the selected bits."""
+    fig, axes = plt.subplots(1, 3, figsize=(6.75, 2.8), sharey=True, layout="constrained")
+    series = (
+        (
+            "LR on all bits",
+            BLUE,
+            "o",
+            "all",
+            ("lr_l1", "lr_l2"),
+            lambda n: range(1, G["MAX_DEG"][n] + 1),
+        ),
+        ("Kernel LR on all bits", ORANGE, "D", "all", ("kpoly",), lambda n: G["KP_DEGS"][n]),
+        ("LR on the selected bits", VIOLET, "s", "sel", ("lr_l2",), lambda n: G["SEL_DEGS"]),
+    )
     for ax, n in zip(axes, NS):
-        for fam in ("lr_l2", "lr_l1"):
-            degs = list(range(1, G["MAX_DEG"][n] + 1))
-            bs = [
-                max(CV.where(n=n, family=fam, sub=f"deg{d}"), key=lambda r: r["mean"]) for d in degs
-            ]
-            ax.plot(degs, [b["mean"] for b in bs], marker=MK[fam], color=COL[fam], label=NAME[fam])
-        kd = G["KP_DEGS"][n]
-        rs = [CV.where(n=n, family="kpoly", sub=f"deg{d}")[0] for d in kd]
-        ax.plot(kd, [r["mean"] for r in rs], marker="D", color=VIOLET, label="Kernel LR, CV")
-        ax.plot(
-            kd, [r["train"] for r in rs], ls=":", marker="D", color=VIOLET, label="Kernel LR, train"
-        )
-        ax.axhline(
-            CV.where(n=n, family="paper")[0]["mean"],
-            color=GRAY,
-            ls="--",
-            lw=1.3,
-            label="Paper baseline",
-        )
+        for label, col, mk, cond, fams, degs in series:
+            bs = [best_of(n, cond, fams, f"deg{d}")["best"] for d in degs(n)]
+            m, s = np.array([b["mean"] for b in bs]), np.array([b["sd"] for b in bs])
+            ax.plot(list(degs(n)), m, marker=mk, ms=4, color=col, label=label)
+            ax.fill_between(list(degs(n)), m - s, m + s, color=col, alpha=0.15, lw=0)
+        base = best_of(n, "all", ("paper",))["best"]["mean"]
+        ax.axhline(base, color=GRAY, ls="--", lw=1.3, label="Paper baseline")
         ax.set_xscale("log")
         ax.set_xticks([1, 2, 4, 10, 20, 40, 80])
         ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
         ax.xaxis.set_minor_formatter(mticker.NullFormatter())
         ax.set_title(f"n = {n}")
         ax.set_xlabel("polynomial degree")
-        ax.set_ylim(0.45, 1.02)
-    axes[0].set_ylabel("accuracy")
-    fig.legend(*axes[0].get_legend_handles_labels(), loc="outside lower center", ncol=3)
+        ax.set_ylim(0.45, 1.0)
+    axes[0].set_ylabel("CV accuracy")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="outside lower center", ncol=2)
     savefig(fig, "fig_degree")
+    print("Mean over the folds (shaded: one sd), best setting at each degree.")
 
 
-def fig_models(final, top_n=8):
-    """Cross-validation accuracy of the best candidates, one dot per fold and a diamond for the
-    mean."""
-    union = {}
-    for n in NS:
-        for g in [g for g in groups(n) if g["key"][0] != "paper"][:top_n] + [
-            g for g in groups(n) if g["key"][0] == "paper"
-        ]:
-            union.setdefault(g["key"], []).append(g["best"]["mean"])
-    # the same rows, in the same order, in every panel
-    order = sorted(union, key=lambda k: -np.mean(union[k]))
-    fig, axes = plt.subplots(1, 3, figsize=(6.75, 3.2), sharey=True, layout="constrained")
+def fig_elimination():
+    """OOB accuracy of the forest against the number of bits still in, one line per fold."""
+    fig, axes = plt.subplots(1, 3, figsize=(6.75, 2.5), sharey=True, layout="constrained")
     for ax, n in zip(axes, NS):
-        byk = {g["key"]: g for g in groups(n)}
-        for i, key in enumerate(order):
-            if key not in byk:
-                continue
-            g, sel = byk[key], key[1] != "all"
-            col, chosen = (VIOLET if sel else COL[key[0]]), key == final[n]["key"]
-            ax.scatter(
-                g["best"]["folds"],
-                [i] * len(g["best"]["folds"]),
-                s=12,
-                color=col,
-                alpha=0.55,
-                zorder=3,
-            )
-            ax.scatter(
-                [g["best"]["mean"]],
-                [i],
-                s=55,
-                color=col,
-                marker="D",
-                zorder=4,
-                edgecolor=(INK if chosen else "white"),
-                linewidth=1.5 if chosen else 0.8,
-            )
-        ax.axvline(0.9, color=GRAY, ls="--", lw=1)
-        ax.set_yticks(range(len(order)))
-        ax.set_yticklabels([sname(k) for k in order])
-        ax.grid(axis="y", alpha=0)
+        paths = fold_paths(n)
+        for p in paths:
+            ax.plot([len(b) for b, _ in p], [a for _, a in p], color=VIOLET, lw=1.2, alpha=0.6)
+        kept = [len(choose_bits(p, FOLD_TRAIN[n])) for p in paths]
+        ax.axvline(np.mean(kept), color=GRAY, ls="--", lw=1.3)
+        ax.axhline(0.5, color=GRAY, ls=":", lw=1)
         ax.set_title(f"n = {n}")
-        ax.set_xlabel("CV accuracy")
-        ax.set_xlim(0.45, 1.0)
-        ax.set_xticks([0.5, 0.75, 1.0])
-    axes[0].set_ylim(len(order) - 0.5, -0.5)
-    savefig(fig, "fig_models")
-    print(
-        "Dots: the folds. Diamond: the mean. Dashed: the 0.9 target. Dark outline: the pipeline"
-        " chosen for that n. Violet: models on the selected bits."
-    )
+        ax.set_xlabel("bits still in")
+        ax.set_xlim(n + 1, 0)
+        ax.set_ylim(0.40, 1.0)
+    axes[0].set_ylabel("OOB accuracy")
+    savefig(fig, "fig_elimination")
+    print("One line per fold; bits are removed from left to right. Dashed: bits kept. Dotted: 0.5.")
 
 
-def fig_selected_bits():
-    """The bits the selector chose in every fold."""
-    fig, axes = plt.subplots(1, 3, figsize=(6.75, 1.9), sharey=True, layout="constrained")
-    for ax, n in zip(axes, NS):
-        post = sel_best(n)["post"]
-        for i, p in enumerate(post):
-            ax.scatter(np.arange(n), [i] * n, s=5, color="#cfcec9", zorder=2)
-            ax.vlines(p["bits"], i - 0.38, i + 0.38, color=VIOLET, lw=2.4, zorder=3)
-        ax.set_yticks(range(len(post)))
-        ax.set_yticklabels([str(i + 1) for i in range(len(post))])
-        ax.grid(axis="y", alpha=0)
-        ax.set_title(f"n = {n}")
-        ax.set_xlabel("bit index")
-    axes[0].set_ylabel("fold")
-    axes[0].set_ylim(len(sel_best(NS[0])["post"]) - 0.5, -0.5)
-    savefig(fig, "fig_selected_bits")
+LOOK = dict(  # label, colour and marker of each learning curve
+    sel=("LR on the selected bits", VIOLET, "s"),
+    lr=("LR on all bits", BLUE, "o"),
+    rf=("Random forest on all bits", AQUA, "^"),
+    mlp=("MLP 4×512 on all bits", MAGENTA, "v"),
+)
 
 
 def fig_learning_curves(cands):
-    """Held-out accuracy against the number of training rows for the top candidates."""
-    pal, mks, style = [VIOLET, ORANGE, BLUE, AQUA, MAGENTA], ["o", "s", "D", "^", "v"], {}
+    """Held-out accuracy against the number of training rows."""
     fig, axes = plt.subplots(1, 3, figsize=(6.75, 3.0), sharey=True, layout="constrained")
     for ax, n in zip(axes, NS):
         for g in cands[n]:
             fam, cond, sub = g["key"]
             rs = sorted(LC.where(n=n, family=fam, cond=cond, sub=sub), key=lambda r: r["size"])
-            S, m, s = (
-                [r["size"] for r in rs],
-                np.array([r["mean"] for r in rs]),
-                np.array([r["sd"] for r in rs]),
-            )
-            i = style.setdefault(sname(g["key"]), len(style))
-            ax.plot(S, m, marker=mks[i % 5], ms=4, color=pal[i % 5], label=sname(g["key"]))
-            ax.fill_between(S, m - s, m + s, color=pal[i % 5], alpha=0.12, lw=0)
-        ax.axhline(0.9, color=GRAY, ls="--", lw=1)
+            S = [r["size"] for r in rs]
+            m, s = np.array([r["mean"] for r in rs]), np.array([r["sd"] for r in rs])
+            label, col, mk = LOOK["sel" if cond == "sel" else fam[:2] if fam[:2] == "lr" else fam]
+            ax.plot(S, m, marker=mk, ms=4, color=col, label=label)
+            ax.fill_between(S, m - s, m + s, color=col, alpha=0.15, lw=0)
         ax.axhline(0.5, color=GRAY, ls=":", lw=1)
         ax.set_xscale("log")
         ax.set_xticks([500, 2000, 10000])
@@ -1232,15 +970,14 @@ def fig_learning_curves(cands):
         ax.xaxis.set_minor_formatter(mticker.NullFormatter())
         ax.set_title(f"n = {n}")
         ax.set_xlabel("training rows")
-        ax.set_ylim(0.40, 1.02)
+        ax.set_ylim(0.40, 1.0)
     axes[0].set_ylabel("held-out accuracy")
-    hl = {}
-    for ax in axes:
-        for h, lab in zip(*ax.get_legend_handles_labels()):
-            hl.setdefault(lab, h)
-    fig.legend(list(hl.values()), list(hl.keys()), loc="outside lower center", ncol=3)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="outside lower center", ncol=2)
     savefig(fig, "fig_learning_curves")
-    print("Mean over the first folds (shaded: one sd). Dashed: the 0.9 target. Dotted: chance.")
+    print(
+        "Mean over the first folds (shaded: one sd), each model at its CV-best setting. Dotted: 0.5"
+    )
 
 
 # ---- Experiments longer than a loop over a grid
@@ -1250,88 +987,41 @@ def choose_final():
     return {n: [g for g in groups(n) if g["key"][0] != "paper"][0] for n in NS}
 
 
-def run_selector_null():
-    """The selector on the training rows of fold 0 with permuted labels: any selected bit beyond
-    the gate is false."""
-    for n in NS:
-        X, B, y = load(n)
-        tr0 = FOLDS[n][0][0]
-        for rep in range(G["NULL_REPS"]):
-
-            def job():
-                t0 = time.time()
-                res = scan_bits(B[tr0], np.random.default_rng(rep).permutation(y[tr0]))
-                sel = choose_bits(res)
-                return dict(
-                    mean=0.0,
-                    sd=0.0,
-                    secs=round(time.time() - t0, 1),
-                    hits4=len(res["hits"]),
-                    n_sel=len(sel["bits"]),
-                    gate_z=sel["gate_z"],
-                )
-
-            run(NUL, f"null|{n}|{rep}", job, quiet=True, exp="NULL", n=n, rep=rep)
-
-
 def run_learning_curves():
-    """Train the top candidates on nested random subsets of the training folds and score them on
-    the held-out fold. For logistic regression C multiplies the summed loss, so the same C
-    penalises more strongly with fewer rows; C is scaled by (full rows / rows used) to keep the
-    penalty per row fixed. Returns the candidates per n."""
-    for k in [k for k, r in LC.rows.items() if r["family"] == "lrfull" and not k.endswith("|cs")]:
-        del LC.rows[k]  # curves from an earlier version with an unscaled C: not used
+    """Train the best model of each kind on nested random subsets of the training folds and score
+    it on the held-out fold. For LR, C multiplies the summed loss, so the same C penalises more
+    strongly with fewer rows; C is scaled by (full rows / rows used) to keep the penalty per row
+    fixed. Returns the models per n."""
     cands = {}
     for n in NS:
-        seen, pick = set(), []
-        for g in groups(n):
-            k2 = g["key"][:2]
-            if g["key"][0] == "paper" or k2 in seen:
-                continue
-            seen.add(k2)
-            pick.append(g)
-            if len(pick) == G["LC_TOP"]:
-                break
-        cands[n] = pick
-        for g in pick:
+        cands[n] = [best_of(n, "sel"), best_of(n, "all"), best_of(n, "all", ("rf",))]
+        if CV.where(n=n, family="mlp", exp="MLP"):
+            cands[n].append(best_of(n, "all", ("mlp",)))
+        for g in cands[n]:
             fam, cond, sub = g["key"]
             p = g["best"]["params"]
-            suf = "|cs" if fam == "lrfull" else ""
-            for size in G["LC_SIZES"]:
-                if size >= FOLD_TRAIN[n]:
-                    continue
-                ps = dict(p, C=p["C"] * FOLD_TRAIN[n] / size) if fam == "lrfull" else p
+            meta = dict(exp="LC", n=n, family=fam, cond=cond, sub=sub)
+            for size in [s for s in G["LC_SIZES"] if s < FOLD_TRAIN[n]]:
+                ps = dict(p, C=p["C"] * FOLD_TRAIN[n] / size) if "C" in p else p
                 run(
                     LC,
-                    f"lc|{n}|{fam}|{cond}|{sub}|{size}{suf}",
+                    f"lc|{n}|{fam}|{cond}|{sub}|{size}",
                     lambda: cv_eval(
-                        lambda: make_estimator(fam, ps, cond),
-                        n,
-                        fam=fam,
-                        size=size,
-                        folds=G["LC_FOLDS"],
+                        lambda: make_estimator(fam, ps, cond), n, size=size, folds=G["LC_FOLDS"]
                     ),
-                    exp="LC",
-                    n=n,
-                    family=fam,
-                    cond=cond,
-                    sub=sub,
                     size=size,
+                    **meta,
                 )
             fr = [g["best"]["folds"][f] for f in G["LC_FOLDS"]]
             run(
                 LC,
-                f"lc|{n}|{fam}|{cond}|{sub}|{FOLD_TRAIN[n]}{suf}",
+                f"lc|{n}|{fam}|{cond}|{sub}|{FOLD_TRAIN[n]}",
                 lambda: dict(
                     folds=fr, mean=float(np.mean(fr)), sd=float(np.std(fr, ddof=1)), secs=0.0
                 ),
                 quiet=True,
-                exp="LC",
-                n=n,
-                family=fam,
-                cond=cond,
-                sub=sub,
                 size=FOLD_TRAIN[n],
+                **meta,
             )
     return cands
 
@@ -1339,9 +1029,6 @@ def run_learning_curves():
 def locked_score(final, n):
     """Refit the final pipeline on all dev rows and score it once on the locked rows (stored; later
     calls read it back)."""
-    key = f"locked|{n}"
-    if key in FIN.rows:
-        return FIN.rows[key]
     fam, cond, sub = final[n]["key"]
     p = final[n]["best"]["params"]
     X, B, y = load(n)
@@ -1357,42 +1044,43 @@ def locked_score(final, n):
             secs=round(time.time() - t0, 1),
             n_test=int(len(te)),
             train=acc(est, B[tr], y[tr]),
-            half=wilson_half(a, len(te)),
-            cv_mean=final[n]["best"]["mean"],
-            cv_sd=final[n]["best"]["sd"],
-            bits=[int(b) for b in est.cols_] if cond != "all" else None,
+            half=binomial_half(a, len(te)),
+            bits=est.cols_ if cond == "sel" else None,
             params=p,
         )
 
+    key = f"locked|{n}|{fam}|{cond}|{sub}|{json.dumps(p, sort_keys=True)}"
     return run(FIN, key, job, exp="FINAL", n=n, family=fam, cond=cond, sub=sub)
 
 
-def shuffled_label_control(final):
-    """The final pipeline on shuffled training labels (first folds) must score about 0.5, otherwise
-    something leaks."""
+def run_controls(final):
+    """Two controls for the final pipeline on the first folds, both expected at about 0.5: shuffled
+    training labels (otherwise something leaks), and the same model on as many unselected bits
+    (otherwise the selected bits are not what carries the label)."""
     for n in NS:
         fam, cond, sub = final[n]["key"]
         p = final[n]["best"]["params"]
+        meta = dict(exp="CONTROL", n=n, family=fam, cond=cond, sub=sub)
         r = run(
             FIN,
             f"shuffle|{n}",
             lambda: cv_eval(
-                lambda: make_estimator(fam, p, cond),
-                n,
-                fam=fam,
-                folds=G["LC_FOLDS"],
-                shuffle_labels=True,
+                lambda: make_estimator(fam, p, cond), n, folds=G["LC_FOLDS"], shuffle_labels=True
             ),
             quiet=True,
-            exp="CONTROL",
-            n=n,
-            family=fam,
-            cond=cond,
-            sub=sub,
+            **meta,
         )
         assert (
             abs(r["mean"] - 0.5) < 0.03
         ), f"n={n}: shuffled-label accuracy {r['mean']:.3f}, possible leakage"
+        if cond == "sel":
+            run(
+                FIN,
+                f"other|{n}",
+                lambda: cv_eval(lambda: make_estimator(fam, p, "other"), n, folds=G["LC_FOLDS"]),
+                quiet=True,
+                **meta,
+            )
 
 
 def predict_hidden(final):
@@ -1402,12 +1090,11 @@ def predict_hidden(final):
         os.makedirs(HIDDEN, exist_ok=True)
     for n in NS:
         fam, cond, sub = final[n]["key"]
-        p = final[n]["best"]["params"]
         X, B, y = load(n)
         Xh = np.load(f"{DATA}/hidden-kryptonite-{n}-X.npy")
         Bh = np.where(Xh > 0, 1.0, -1.0).astype(np.float32)
-        est = make_estimator(fam, p, cond).fit(B, y)
-        pred = est.predict(Bh).astype(np.int64)
+        pred = make_estimator(fam, final[n]["best"]["params"], cond).fit(B, y).predict(Bh)
+        pred = pred.astype(np.int64)
         assert pred.shape == (10_000,) and set(np.unique(pred)) <= {0, 1}, "wrong shape or values"
         assert 0.45 <= pred.mean() <= 0.55, f"suspicious class balance {pred.mean():.3f}"
         assert (
@@ -1417,25 +1104,12 @@ def predict_hidden(final):
             np.mean(np.abs(Xh - Bh) < 0.5) > 0.999
         ), "hidden inputs are not clean +-1 bits plus small noise"
         msg = f"n={n}: {kname(final[n]['key'])}, predicted positive rate {pred.mean():.3f}"
-        alt = next(
-            (
-                g
-                for g in groups(n)
-                if g["key"][:2] != (fam, cond)
-                and g["key"][0] != "paper"
-                and g["best"]["mean"] > 0.9
-            ),
-            None,
-        )
-        if alt:  # a second good model should mostly agree
-            agree = float(
-                (
-                    make_estimator(alt["key"][0], alt["best"]["params"], alt["key"][1])
-                    .fit(B, y)
-                    .predict(Bh)
-                    == pred
-                ).mean()
-            )
+        # a good model of a different kind (other bits used, else other penalty) should mostly agree
+        good = [g for g in groups(n) if g["best"]["mean"] > 0.9 and g["key"][:2] != (fam, cond)]
+        alt = next((g for g in good if g["key"][1] != cond), good[0] if good else None)
+        if alt:
+            other = make_estimator(alt["key"][0], alt["best"]["params"], alt["key"][1]).fit(B, y)
+            agree = float((other.predict(Bh) == pred).mean())
             msg += f"; agrees with {kname(alt['key'])} on {agree:.1%}" + (
                 "  <-- LOW, look at this" if agree < 0.85 else ""
             )
