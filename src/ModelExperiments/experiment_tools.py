@@ -199,9 +199,10 @@ def _label(key, meta):
 
 
 # ---- Energy: CodeCarbon reads the CPU's own energy counters (RAPL) through the Windows Energy
-# Meter Interface (Windows 11) or /sys/class/powercap (Linux), and the GPU's through NVML. Each
-# stored result records the energy used while it was computed, so the totals survive a resumed
-# run. Where no counter can be read CodeCarbon falls back to an estimate; carbon_report() then
+# Meter Interface (Windows 11) or /sys/class/powercap (Linux). Each stored result records the
+# energy used while it was computed, so the totals survive a resumed run. CodeCarbon also reads an
+# NVIDIA GPU if present; that is stored but not reported, as no model uses the GPU. Where no
+# counter can be read CodeCarbon falls back to an estimate; carbon_report() then
 # says so and reports no energy.
 MEASURED = ("intel_rapl", "windows_emi", "intel_power_gadget")
 _TRACKER = []  # [tracker, task active?], made on first use
@@ -1275,43 +1276,26 @@ def carbon_report():
 
     tot = {}
     for r in rows:
-        t = tot.setdefault(name(r), np.zeros(3))
-        t += [r.get("secs", 0) / 3600, r["energy"]["cpu_kwh"], r["energy"]["gpu_kwh"]]
+        t = tot.setdefault(name(r), np.zeros(2))
+        t += [r.get("secs", 0) / 3600, r["energy"]["cpu_kwh"] * 1000]
     total = np.sum(list(tot.values()), axis=0)
 
     def line(k, v):
-        wh = (v[1] + v[2]) * 1000
-        return [
-            k,
-            f"{v[0]:.2f}",
-            f"{v[1] * 1000:.1f}",
-            f"{v[2] * 1000:.1f}",
-            f"{wh:.1f}",
-            f"{wh * GRID_G_PER_KWH / 1000:.1f}",
-        ]
+        return [k, f"{v[0]:.2f}", f"{v[1]:.1f}", f"{v[1] * GRID_G_PER_KWH / 1000:.1f}"]
 
     out = [line(k, v) for k, v in tot.items()] + [line("Total", total)]
-    text_table(
-        ["", "hours", "CPU Wh", "GPU Wh", "Wh", "g CO2e"], out, "Measured energy by experiment"
-    )
-    gpus = sorted({str(r["energy"]["gpu"]) for r in rows if r["energy"]["gpu"]})
-    gpu = (
-        f"GPU: {', '.join(gpus)}; no model here uses it, so its share is idle draw."
-        if gpus
-        else "No GPU was measured."
-    )
+    text_table(["", "hours", "CPU Wh", "g CO2e"], out, "Measured CPU energy by experiment")
     print(
-        f"CPU: {', '.join(sorted(modes))}, machine-wide. {gpu}\nRAM and screen are not measured."
-        f" g CO2e at {GRID_G_PER_KWH} g per kWh (NESO, GB average for 2024)."
+        f"Read from the CPU's energy counters ({', '.join(sorted(modes))}), whole package. Every"
+        " model runs on the CPU only,\nso no GPU energy is counted; RAM and screen are not"
+        f" measured. g CO2e at {GRID_G_PER_KWH} g per kWh (NESO, GB 2024 average)."
     )
     if dropped:
-        wh = sum((r["energy"]["cpu_kwh"] + r["energy"]["gpu_kwh"]) * 1000 for r in dropped)
+        wh = sum(r["energy"]["cpu_kwh"] * 1000 for r in dropped)
         print(f"Not included: {len(dropped)} K-means results from an earlier version, {wh:.1f} Wh.")
 
     def cv_cost(pick):
-        return sum(
-            (r["energy"]["cpu_kwh"] + r["energy"]["gpu_kwh"]) * 1000 for r in rows if pick(r)
-        )
+        return sum(r["energy"]["cpu_kwh"] * 1000 for r in rows if pick(r))
 
     for n in NS:
         sel = cv_cost(
