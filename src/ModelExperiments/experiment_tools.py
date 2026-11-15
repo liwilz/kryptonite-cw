@@ -18,7 +18,6 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import sklearn
-from sklearn.cluster import KMeans
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.inspection import permutation_importance
@@ -51,7 +50,6 @@ G = dict(
     RF_TREES=200,
     RF_MAXF=["sqrt", 0.5, 1.0],
     RF_LEAF=[1, 5],
-    KM_K=[8, 32, 128],
     MLP_H=[512, 512, 512, 512],  # KryptoNet's shape
     MLP_ALPHA=1e-2,
     MLP_MAXITER=200,  # epoch cap; check_caps() reports any fit that reached it
@@ -71,7 +69,6 @@ if QUICK:  # dry run: 3 folds, 3,000 rows, small grids, separate folders, no pre
         RF_TREES=30,
         RF_MAXF=["sqrt", 1.0],
         RF_LEAF=[5],
-        KM_K=[4, 16],
         MLP_MAXITER=40,
         MLP_PATIENCE=10,
         SEL_DEGS=[2, 6, 10],
@@ -99,7 +96,6 @@ NAME = dict(
     lr_l1="LR, L1",
     kpoly="Kernel LR",
     rf="Random forest",
-    kmeans="K-means",
     mlp="MLP 4×512",
     paper="Paper baseline",
 )
@@ -289,7 +285,10 @@ def eliminate_bits(B, y, seed=SEED):
         ).fit(B[fit][:, cols], y[fit])
         Bv = B[val][:, cols]
         path.append([list(cols), float((rf.predict(Bv) == y[val]).mean())])
-        imp = permutation_importance(rf, Bv, y[val], n_repeats=5, random_state=seed)
+        # one process per shuffled bit; a forest that also split each small prediction across
+        # all cores spent most of its time on that overhead. Same result either way.
+        rf.set_params(n_jobs=1)
+        imp = permutation_importance(rf, Bv, y[val], n_repeats=5, random_state=seed, n_jobs=-1)
         cols.pop(int(np.argmin(imp.importances_mean)))
     return path
 
@@ -441,25 +440,6 @@ class PaperBaseline:
         return self.m_.predict(self.pf_.transform(X))
 
 
-class KMeansMajority:
-    """K-means on the bits (fitted on the training rows only); each cluster predicts its training
-    majority label."""
-
-    def __init__(self, k):
-        self.k = k
-
-    def fit(self, B, y):
-        self.km_ = KMeans(self.k, n_init=3, max_iter=100, random_state=SEED).fit(B)
-        lab = self.km_.labels_
-        cnt = np.bincount(lab, minlength=self.k)
-        pos = np.bincount(lab, weights=y, minlength=self.k)
-        self.vote_ = (np.where(cnt > 0, pos / np.maximum(cnt, 1), y.mean()) > 0.5).astype(np.int64)
-        return self
-
-    def predict(self, B):
-        return self.vote_[self.km_.predict(B)]
-
-
 def lr_clf(pen, C):
     if pen == "l2":
         return LogisticRegression(C=C, max_iter=300)
@@ -492,8 +472,6 @@ def make_estimator(family, p, cond="all"):
             n_jobs=-1,
             random_state=SEED,
         )
-    elif family == "kmeans":
-        est = KMeansMajority(p["k"])
     elif family == "mlp":
         est = MLPClassifier(
             tuple(p["h"]),
@@ -633,7 +611,7 @@ def groups(n):
     """One entry per (family, condition, sub-model) with its CV-best setting, best first."""
     d = {}
     for r in CV.rows.values():
-        if r["n"] == n and len(r["folds"]) == K:
+        if r["n"] == n and len(r["folds"]) == K and r["family"] in NAME:  # skip cut models
             d.setdefault((r["family"], r["cond"], r["sub"]), []).append(r)
     pref = {"all": 0, "sel": 1}  # exact ties: all-bits first
     return sorted(
@@ -753,13 +731,12 @@ def table_degree_all():
 def table_families():
     """The best setting of every other model family on all bits."""
     rows = [
-        ["K-means (cluster majority)"] + [_mean_sd(n, "all", ("kmeans",)) for n in NS],
         ["Random forest"] + [_mean_sd(n, "all", ("rf",)) for n in NS],
         ["MLP 4×512"] + [_mean_sd(n, "all", ("mlp",)) for n in NS],
         ["Best polynomial LR, for reference"]
         + [_mean_sd(n, "all", ("lr_l1", "lr_l2", "kpoly")) for n in NS],
     ]
-    grid("Other models on all bits: CV accuracy (mean ± sd over folds, best setting)", rows)
+    grid("Trained from scratch on all bits: CV accuracy (mean ± sd over folds)", rows)
     for n in NS:
         g = best_of(n, "all", ("rf",))
         print(f"n = {n}: best forest has {show_params(g['best']['params'])}")
@@ -831,8 +808,7 @@ def summary_rows(final):
         ("deg", "degree", degree("all", ("lr_l1", "lr_l2"))),
         ("row", "Paper's kernel, best degree", [b["mean"] for b in best("all", ("kpoly",))]),
         ("deg", "degree", degree("all", ("kpoly",))),
-        ("group", "Other models on all bits"),
-        ("row", "K-means", [b["mean"] for b in best("all", ("kmeans",))]),
+        ("group", "Trained from scratch on all bits"),
         ("row", "Random forest", [b["mean"] for b in best("all", ("rf",))]),
     ]
     if all(CV.where(n=n, family="mlp", exp="MLP") for n in NS):
@@ -845,10 +821,11 @@ def summary_rows(final):
         ("row", "Locked test accuracy", [locked_score(final, n)["mean"] for n in NS]),
     ]
     kp = ", ".join(kernel_label(i) for i in range(len(G["KP_DEGS"][NS[0]])))
+    md = ", ".join(str(G["MAX_DEG"][n]) for n in NS)
     notes = [
         f"{K}-fold CV on the dev rows, except the last row. A coin flip scores 0.50.",
-        f"Degrees tried: explicit monomials up to the largest that fits in memory"
-        f" ({', '.join(str(G['MAX_DEG'][n]) for n in NS)}); kernel {kp}.",
+        f"Degrees tried on all bits: explicit monomials up to {md} (the largest that fits",
+        f"in memory); kernel {kp}.",
     ]
     return rows, notes
 
@@ -962,7 +939,7 @@ def fig_summary_table(final):
     for i, r in enumerate(rows):
         group_of.append(i if r[0] == "group" else group_of[-1])
     counted = [i for i, r in enumerate(rows) if r[0] == "row" and group_of[i] != max(group_of)]
-    top = [max(rows[i][2][c] for i in counted) for c in range(len(NS))]
+    top = [max(round(rows[i][2][c], 3) for i in counted) for c in range(len(NS))]
 
     def rule(y, lw):
         ax.plot([0, 1], [y, y], color=INK, lw=lw, solid_capstyle="butt", clip_on=False)
@@ -983,7 +960,7 @@ def fig_summary_table(final):
         indent, col = (0.06, GRAY) if r[0] == "deg" else (0.03, INK)
         ax.text(indent, i, r[1], va="center", color=col)
         for c, v in enumerate(r[2]):
-            weight = "bold" if i - 1 in counted and v == top[c] else "normal"
+            weight = "bold" if i - 1 in counted and round(v, 3) == top[c] else "normal"
             text, col = (str(v), GRAY) if r[0] == "deg" else (f"{v:.3f}", INK)
             ax.text(right[c], i, text, ha="right", va="center", color=col, fontweight=weight)
     rule(len(rows) + 0.5, 1.2)
@@ -996,7 +973,9 @@ def fig_degree():
     """CV accuracy against the polynomial degree: explicit monomials and the paper's kernel on all
     bits, explicit monomials on the kept bits."""
     fig, axes = plt.subplots(1, 3, figsize=(6.75, 2.8), sharey=True, layout="constrained")
-    series = (
+    series = (  # drawn in this order, so LR on all bits stays visible where the two LR lines meet
+        ("LR on the kept bits", VIOLET, "s", "sel", ("lr_l2",), lambda n: G["SEL_DEGS"]),
+        ("Kernel LR on all bits", ORANGE, "D", "all", ("kpoly",), lambda n: G["KP_DEGS"][n]),
         (
             "LR on all bits",
             BLUE,
@@ -1005,14 +984,12 @@ def fig_degree():
             ("lr_l1", "lr_l2"),
             lambda n: range(1, G["MAX_DEG"][n] + 1),
         ),
-        ("Kernel LR on all bits", ORANGE, "D", "all", ("kpoly",), lambda n: G["KP_DEGS"][n]),
-        ("LR on the kept bits", VIOLET, "s", "sel", ("lr_l2",), lambda n: G["SEL_DEGS"]),
     )
     for ax, n in zip(axes, NS):
         for label, col, mk, cond, fams, degs in series:
             bs = [best_of(n, cond, fams, f"deg{d}")["best"] for d in degs(n)]
             m, s = np.array([b["mean"] for b in bs]), np.array([b["sd"] for b in bs])
-            ax.plot(list(degs(n)), m, marker=mk, ms=4, color=col, label=label)
+            ax.plot(list(degs(n)), m, marker=mk, ms=4 if mk != "o" else 5, color=col, label=label)
             ax.fill_between(list(degs(n)), m - s, m + s, color=col, alpha=0.15, lw=0)
         base = best_of(n, "all", ("paper",))["best"]["mean"]
         ax.axhline(base, color=GRAY, ls="--", lw=1.3, label="Paper baseline")
@@ -1257,9 +1234,15 @@ def check_caps():
         print(f"{r['key']}: {r['capped']} fold(s) stopped at the iteration cap")
 
 
+GRID_G_PER_KWH = 125  # NESO, "Britain's Electricity Explained: 2024 Review": GB average for 2024
+
+
 def carbon_report():
-    """Energy and emissions of every stored result, as measured by CodeCarbon, by experiment."""
+    """Energy measured by CodeCarbon for every stored result, by experiment, and the emissions at
+    GRID_G_PER_KWH."""
     rows = [r for st in (CV, LC, SEL, FIN) for r in st.rows.values()]
+    dropped = [r for r in rows if r.get("family") == "kmeans" and r.get("energy")]
+    rows = [r for r in rows if r.get("family") != "kmeans"]  # cut from the notebook, see below
     missing = [r for r in rows if "energy" not in r]
     rows = [r for r in rows if r.get("energy")]
     modes = {r["energy"]["cpu_mode"] for r in rows}
@@ -1270,38 +1253,79 @@ def carbon_report():
             f" by the CPU's counters ({', '.join(MEASURED)})."
         )
         return
-    groups_ = dict(
-        LR="Polynomial LR on all bits",
+    names = dict(
         BASE="Polynomial LR on all bits",
+        LR="Polynomial LR on all bits",
         KPOLY="Kernel LR on all bits",
-        KM="K-means",
         RF="Random forest on all bits",
         FOLD="MLP 4×512",
         MLP="MLP 4×512",
-        ELIM="Bit elimination",
         LC="Learning curves",
-        CONTROL="Final pipeline and controls",
-        FINAL="Final pipeline and controls",
+        CONTROL="Final pipeline: controls and locked test",
+        FINAL="Final pipeline: controls and locked test",
         HIDDEN="Hidden-set refits",
     )
+
+    def name(r):
+        if r.get("exp") == "ELIM":
+            return "Bit elimination" + (" (stability check)" if r.get("seed", SEED) != SEED else "")
+        if r.get("exp") == "LR" and r.get("cond") == "sel":
+            return "Polynomial LR on the kept bits"
+        return names.get(r.get("exp"), str(r.get("exp")))
+
     tot = {}
     for r in rows:
-        name = "LR on the kept bits" if r.get("cond") == "sel" and r.get("exp") == "LR" else None
-        name = name or groups_.get(r.get("exp"), r.get("exp"))
-        e = r["energy"]
-        t = tot.setdefault(name, [0.0, 0.0, 0.0])
-        t[0] += r.get("secs", 0) / 3600
-        t[1] += e["cpu_kwh"] + e["gpu_kwh"]
-        t[2] += (e["cpu_kwh"] + e["gpu_kwh"]) * e["g_per_kwh"]
-    out = [[k, f"{v[0]:.2f}", f"{v[1] * 1000:.1f}", f"{v[2]:.1f}"] for k, v in tot.items()]
-    s_ = np.sum(list(tot.values()), axis=0)
-    out.append(["Total", f"{s_[0]:.2f}", f"{s_[1] * 1000:.1f}", f"{s_[2]:.1f}"])
-    text_table(["", "hours", "Wh", "g CO2e"], out, "Measured energy by experiment")
-    g = sorted({round(r["energy"]["g_per_kwh"], 1) for r in rows})
-    gpus = sorted({str(r["energy"]["gpu"]) for r in rows})
-    print(
-        f"CPU energy from {', '.join(sorted(modes))} (machine-wide, so close other programs);"
-        f" GPU: {', '.join(gpus)}. RAM and screen are not measured and not included."
-        f"\nCarbon intensity: CodeCarbon's annual average for the UK grid, {', '.join(map(str, g))}"
-        " g CO2e per kWh."
+        t = tot.setdefault(name(r), np.zeros(3))
+        t += [r.get("secs", 0) / 3600, r["energy"]["cpu_kwh"], r["energy"]["gpu_kwh"]]
+    total = np.sum(list(tot.values()), axis=0)
+
+    def line(k, v):
+        wh = (v[1] + v[2]) * 1000
+        return [
+            k,
+            f"{v[0]:.2f}",
+            f"{v[1] * 1000:.1f}",
+            f"{v[2] * 1000:.1f}",
+            f"{wh:.1f}",
+            f"{wh * GRID_G_PER_KWH / 1000:.1f}",
+        ]
+
+    out = [line(k, v) for k, v in tot.items()] + [line("Total", total)]
+    text_table(
+        ["", "hours", "CPU Wh", "GPU Wh", "Wh", "g CO2e"], out, "Measured energy by experiment"
     )
+    gpus = sorted({str(r["energy"]["gpu"]) for r in rows if r["energy"]["gpu"]})
+    gpu = (
+        f"GPU: {', '.join(gpus)}; no model here uses it, so its share is idle draw."
+        if gpus
+        else "No GPU was measured."
+    )
+    print(
+        f"CPU: {', '.join(sorted(modes))}, machine-wide. {gpu}\nRAM and screen are not measured."
+        f" g CO2e at {GRID_G_PER_KWH} g per kWh (NESO, GB average for 2024)."
+    )
+    if dropped:
+        wh = sum((r["energy"]["cpu_kwh"] + r["energy"]["gpu_kwh"]) * 1000 for r in dropped)
+        print(f"Not included: {len(dropped)} K-means results from an earlier version, {wh:.1f} Wh.")
+
+    def cv_cost(pick):
+        return sum(
+            (r["energy"]["cpu_kwh"] + r["energy"]["gpu_kwh"]) * 1000 for r in rows if pick(r)
+        )
+
+    for n in NS:
+        sel = cv_cost(
+            lambda r: r.get("n") == n
+            and (
+                r.get("exp") == "ELIM"
+                and r.get("seed", SEED) == SEED
+                and r.get("rows") == FOLD_TRAIN[n]
+                or r.get("exp") == "LR"
+                and r.get("cond") == "sel"
+            )
+        )
+        mlp = cv_cost(lambda r: r.get("n") == n and r.get("exp") in ("FOLD", "MLP"))
+        print(
+            f"n = {n}: {K}-fold CV of the kept-bits pipeline (elimination + LR grid) {sel:.1f} Wh;"
+            f" of the MLP {mlp:.1f} Wh"
+        )
