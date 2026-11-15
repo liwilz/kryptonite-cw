@@ -1,4 +1,4 @@
-"""Helpers for Experiments.ipynb: settings, data splits, the models, the bit elimination, result
+"""Helpers for Experiments.ipynb: settings, data splits, the models, the bit weights, result
 storage, tables and figures. The notebook calls these; the experiments themselves are in it."""
 
 import hashlib
@@ -12,12 +12,11 @@ import time
 import warnings
 from fractions import Fraction
 from functools import lru_cache
-from math import ceil, comb
+from math import comb
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
-import sklearn
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.inspection import permutation_importance
@@ -39,11 +38,9 @@ ROWS = None  # None = all labelled rows
 OUT, FIG = "exp_cache", "exp_figures"  # OUT only lets an interrupted run resume
 WRITE_PREDICTIONS = True
 RUN_MLP = True  # the 4 x 512 MLP, the slowest experiment
-MAX_BITS = 14  # most bits the elimination may keep: a degree-10 polynomial on more is too large
 
 G = dict(
     C_L2=[1e-3, 1e-2, 1e-1, 1],
-    C_L1=[3e-3, 1e-2, 3e-2, 1e-1],
     MAX_DEG={20: 4, 30: 3, 40: 2},  # largest degree whose monomials on all bits fit in memory
     KP_DEGS={n: [6, 10, 15, n, 2 * n] for n in NS},  # degrees of the paper's kernel
     KP_C=0.85,
@@ -54,16 +51,16 @@ G = dict(
     MLP_ALPHA=1e-2,
     MLP_MAXITER=200,  # epoch cap; check_caps() reports any fit that reached it
     MLP_PATIENCE=15,
-    SEL_DEGS=list(range(1, 11)),  # degrees tried on the kept bits
+    WK_DEGS=[6, 10, 15],  # weighted polynomial kernel: degrees
+    WK_C=[10, 100],  # and C, with forest weights
+    WK_UNIFORM_C=10,  # C of the same kernel with equal weights, the comparison
     LC_SIZES=[250, 500, 1000, 2000, 4000],  # learning curves; the full fold-train set is added
     LC_FOLDS=(0, 1, 2),
-    ELIM_SEEDS=(1, 2),  # extra forest seeds for the stability check of the elimination
 )
 if QUICK:  # dry run: 3 folds, 3,000 rows, small grids, separate folders, no predictions
     K, ROWS, OUT, FIG, WRITE_PREDICTIONS = 3, 3000, "exp_cache_quick", "exp_figures_quick", False
     G.update(
         C_L2=[1e-2, 1e-1],
-        C_L1=[1e-2, 1e-1],
         MAX_DEG={20: 2, 30: 2, 40: 2},
         KP_DEGS={n: [10, n] for n in NS},
         RF_TREES=30,
@@ -71,10 +68,10 @@ if QUICK:  # dry run: 3 folds, 3,000 rows, small grids, separate folders, no pre
         RF_LEAF=[5],
         MLP_MAXITER=40,
         MLP_PATIENCE=10,
-        SEL_DEGS=[2, 6, 10],
+        WK_DEGS=[6, 10],
+        WK_C=[10],
         LC_SIZES=[100, 250, 500],
         LC_FOLDS=(0, 1),
-        ELIM_SEEDS=(1,),
     )
 if not os.path.isfile(f"{DATA}/kryptonite-20-X.npy"):
     raise FileNotFoundError(
@@ -93,8 +90,9 @@ warnings.filterwarnings("ignore", message=".*encountered in matmul")
 # ---- Names used in tables and figures
 NAME = dict(
     lr_l2="LR, L2",
-    lr_l1="LR, L1",
     kpoly="Kernel LR",
+    wkpoly="Weighted kernel LR",
+    ukpoly="Equal-weight kernel LR",
     rf="Random forest",
     mlp="MLP 4×512",
     paper="Paper baseline",
@@ -104,11 +102,7 @@ NAME = dict(
 def kname(key):
     """Full name of a (family, condition, sub-model) key."""
     fam, cond, sub = key
-    return (
-        NAME[fam]
-        + (f", degree {sub[3:]}" if sub.startswith("deg") else "")
-        + (" on the kept bits" if cond == "sel" else "")
-    )
+    return NAME[fam] + (f", degree {sub[3:]}" if sub.startswith("deg") else "")
 
 
 def show_params(p):
@@ -187,7 +181,7 @@ class Store:
         return [r for r in self.rows.values() if all(r.get(k) == v for k, v in kw.items())]
 
 
-CV, LC, SEL, FIN = (Store(nm) for nm in ("cv_results", "learning_curves", "elimination", "final"))
+CV, LC, WTS, FIN = (Store(nm) for nm in ("cv_results", "learning_curves", "weights", "final"))
 
 
 def _label(key, meta):
@@ -227,7 +221,7 @@ def _tracker():
 
 def _measured(fn):
     """fn() plus the energy CodeCarbon recorded while it ran. A call inside another measured call
-    (the bit elimination inside a model fit) is counted in the outer one."""
+    (the bit weights inside a model fit) is counted in the outer one."""
     tr = _tracker()
     if tr[1]:
         return dict(fn(), energy=None)  # counted in the enclosing result
@@ -243,6 +237,7 @@ def _measured(fn):
         cpu_kwh=float(d.cpu_energy),
         gpu_kwh=float(d.gpu_energy),
         cpu_mode=modes[0] if modes else None,
+        cpu=d.cpu_model or None,
         gpu=d.gpu_model or None,
         g_per_kwh=float(d.emissions / d.energy_consumed * 1000) if d.energy_consumed else None,
     )
@@ -266,86 +261,49 @@ def run(store, key, fn, quiet=False, **meta):
     return row
 
 
-# ---- Bit selection: recursive feature elimination (Guyon et al., 2002) with a random forest and
-# permutation importance (Breiman, 2001)
-ELIM_VAL = 0.25  # share of the training rows held out inside the elimination
+# ---- Bit weights: one random forest per set of training rows. A bit's weight is its permutation
+# importance (Breiman, 2001): the drop in the forest's accuracy on a held-out quarter of those rows
+# when that bit's values are shuffled; clipped at 0 and scaled so the largest weight is 1.
+def bit_weights(B, y, seed=SEED):
+    fit, val = train_test_split(np.arange(len(y)), test_size=0.25, stratify=y, random_state=seed)
+    rf = RandomForestClassifier(
+        G["RF_TREES"], max_features=1.0, min_samples_leaf=5, n_jobs=-1, random_state=seed
+    ).fit(B[fit], y[fit])
+    # one process per shuffled bit; a forest that also split each small prediction across all
+    # cores spends most of its time on that overhead. Same result either way.
+    rf.set_params(n_jobs=1)
+    imp = permutation_importance(
+        rf, B[val], y[val], n_repeats=5, random_state=seed, n_jobs=-1
+    ).importances_mean
+    w = np.clip(imp, 0, None)
+    return (w / w.max() if w.max() > 0 else np.ones_like(w)).tolist()
 
 
-def eliminate_bits(B, y, seed=SEED):
-    """Hold out a quarter of the rows. Fit a forest on the other three quarters using the bits
-    still in, record its accuracy on the held-out quarter, and drop the bit with the lowest
-    permutation importance (the drop in held-out accuracy when that bit's values are shuffled).
-    Repeat until one bit is left. Returns [[bits, held-out accuracy], ...]."""
-    fit, val = train_test_split(
-        np.arange(len(y)), test_size=ELIM_VAL, stratify=y, random_state=seed
-    )
-    cols, path = list(range(B.shape[1])), []
-    while cols:
-        rf = RandomForestClassifier(
-            G["RF_TREES"], max_features=1.0, min_samples_leaf=5, n_jobs=-1, random_state=seed
-        ).fit(B[fit][:, cols], y[fit])
-        Bv = B[val][:, cols]
-        path.append([list(cols), float((rf.predict(Bv) == y[val]).mean())])
-        # one process per shuffled bit; a forest that also split each small prediction across
-        # all cores spent most of its time on that overhead. Same result either way.
-        rf.set_params(n_jobs=1)
-        imp = permutation_importance(rf, Bv, y[val], n_repeats=5, random_state=seed, n_jobs=-1)
-        cols.pop(int(np.argmin(imp.importances_mean)))
-    return path
-
-
-def choose_bits(path, N):
-    """The smallest set of at most MAX_BITS bits whose held-out accuracy is within one standard
-    error of the best such set (the one-standard-error rule). N: rows the elimination ran on."""
-    path = [(bits, a) for bits, a in path if len(bits) <= MAX_BITS]
-    best = max(a for _, a in path)
-    se = np.sqrt(best * (1 - best) / ceil(ELIM_VAL * N))
-    return sorted(min((bits for bits, a in path if a >= best - se), key=len))
-
-
-def get_path(B, y, seed=SEED):
-    """eliminate_bits, stored under a hash of the rows so the same rows are processed once."""
+def get_weights(B, y, seed=SEED):
+    """bit_weights, stored under a hash of the rows so the same rows are processed once."""
     key = hashlib.md5(np.ascontiguousarray(B).tobytes() + y.astype(np.int8).tobytes()).hexdigest()
     key += "" if seed == SEED else f"|seed{seed}"
 
     def job():
         t0 = time.time()
-        path = eliminate_bits(B, y, seed)
-        return dict(path=path, mean=0.0, sd=0.0, secs=round(time.time() - t0, 1))
+        w = bit_weights(B, y, seed)
+        return dict(w=w, mean=0.0, sd=0.0, secs=round(time.time() - t0, 1))
 
-    return run(SEL, key, job, quiet=True, exp="ELIM", n=B.shape[1], rows=len(y), seed=seed)["path"]
+    row = run(WTS, key, job, quiet=True, exp="WTS", n=B.shape[1], rows=len(y), seed=seed)
+    return np.array(row["w"])
 
 
-def fold_paths(n, seed=SEED):
-    """The elimination path on the training rows of every fold."""
+def fold_weights(n, seed=SEED):
+    """The bit weights on the training rows of every fold."""
     X, B, y = load(n)
-    return [get_path(B[tr], y[tr], seed) for tr, _ in FOLDS[n]]
+    return [get_weights(B[tr], y[tr], seed) for tr, _ in FOLDS[n]]
 
 
-class BitModel:
-    """Wraps any estimator: eliminate bits on the rows it is fitted on, then fit the estimator on
-    the bits kept. other=True is a control: it uses as many bits drawn at random from the
-    eliminated ones."""
-
-    def __init__(self, base, other=False):
-        self.base, self.other = base, other
-
-    def fit(self, B, y):
-        self.cols_ = choose_bits(get_path(B, y), len(y))
-        rest = [i for i in range(B.shape[1]) if i not in self.cols_]
-        if self.other and rest:
-            k = min(len(self.cols_), len(rest))
-            self.cols_ = sorted(np.random.default_rng(SEED).choice(rest, k, replace=False).tolist())
-        self.base.fit(B[:, self.cols_], y)
-        return self
-
-    def predict(self, B):
-        return self.base.predict(B[:, self.cols_])
+def top_bits(w, k=10):
+    return sorted(np.argsort(-np.asarray(w))[:k].tolist())
 
 
 # ---- Models
-# penalty= is deprecated since scikit-learn 1.8 in favour of l1_ratio=
-NEW_SKLEARN = tuple(int(v) for v in sklearn.__version__.split(".")[:2]) >= (1, 8)
 
 
 @lru_cache(None)
@@ -426,6 +384,79 @@ class KernelPolyLR:
         return (self.decision_function(B) > 0).astype(np.int64)
 
 
+class WeightedKernelLR:
+    """Logistic regression with the polynomial kernel k(x, x') = ((1 + sum_i w_i x_i x'_i) /
+    (1 + sum_i w_i))^d, trained in the dual like KernelPolyLR. weights='forest': w is computed
+    inside fit() from the rows it is fitted on (bit_weights), so it never sees validation or
+    test rows; 'equal': w = 1 for every bit; 'reversed': the forest's weights moved to the
+    wrong bits (the largest weight on the least important bit), a control. The Gram matrix is
+    kept in float32 so that 32,000 rows fit in memory (4 GB). L-BFGS stops when the loss improves
+    by less than a relative 1e-6 per step (ftol)."""
+
+    def __init__(self, deg, C, weights="forest", maxiter=3000):
+        self.deg, self.C, self.weights, self.maxiter = deg, C, weights, maxiter
+
+    def _gram(self, A, B):
+        A = np.asarray(A, np.float32) * self.w_.astype(np.float32)
+        B = np.asarray(B, np.float32)
+        K = np.empty((len(A), len(B)), np.float32)
+        z = np.float32(1 + self.w_.sum())
+        for i in range(0, len(A), 1000):  # row blocks: no large temporaries
+            K[i : i + 1000] = ((1 + A[i : i + 1000] @ B.T) / z) ** self.deg
+        return K
+
+    def fit(self, B, y):
+        from scipy.optimize import minimize
+        from scipy.special import expit
+
+        if self.weights == "equal":
+            self.w_ = np.ones(B.shape[1])
+        else:
+            w = get_weights(B, y)
+            if self.weights == "reversed":
+                order = np.argsort(w)
+                w2 = np.empty_like(w)
+                w2[order] = np.sort(w)[::-1]
+                w = w2
+            self.w_ = np.asarray(w, np.float64)
+        N = len(y)
+        K = self._gram(B, B)
+        s = 2.0 * y - 1
+        C = self.C
+
+        def fg(p):
+            a, b = p[:N], p[N]
+            Ka = (K @ a.astype(np.float32)).astype(np.float64)
+            m = -s * (Ka + b)
+            g = -s * expit(m)
+            grad = (K @ g.astype(np.float32)).astype(np.float64) + Ka / C
+            return np.logaddexp(0, m).sum() + 0.5 / C * (a @ Ka), np.append(grad, g.sum())
+
+        r = minimize(
+            fg,
+            np.zeros(N + 1),
+            jac=True,
+            method="L-BFGS-B",
+            options=dict(maxiter=self.maxiter, ftol=1e-6),
+        )
+        self.a_, self.b_, self.iters_ = r.x[:N].astype(np.float32), float(r.x[N]), int(r.nit)
+        self.B_ = np.asarray(B, np.float32)
+        self.f_train_ = (K @ self.a_).astype(np.float64) + self.b_
+        return self
+
+    def decision_function(self, B):
+        B = np.asarray(B, np.float32)
+        if B.shape == self.B_.shape and np.array_equal(B, self.B_):
+            return self.f_train_
+        out = np.empty(len(B))
+        for i in range(0, len(B), 2000):
+            out[i : i + 2000] = self._gram(B[i : i + 2000], self.B_) @ self.a_ + self.b_
+        return out
+
+    def predict(self, B):
+        return (self.decision_function(B) > 0).astype(np.int64)
+
+
 class PaperBaseline:
     """The mock paper's model: PolynomialFeatures(2) on the raw inputs, logistic regression, C =
     0.85."""
@@ -441,30 +472,22 @@ class PaperBaseline:
         return self.m_.predict(self.pf_.transform(X))
 
 
-def lr_clf(pen, C):
-    if pen == "l2":
-        return LogisticRegression(C=C, max_iter=300)
-    if NEW_SKLEARN:
-        return LogisticRegression(
-            C=C, l1_ratio=1, solver="liblinear", max_iter=100, random_state=SEED
-        )
-    return LogisticRegression(
-        C=C, penalty="l1", solver="liblinear", max_iter=100, random_state=SEED
-    )
-
-
 def make_estimator(family, p, cond="all"):
-    """Build any model. p: JSON-friendly hyper-parameters. cond: 'all' bits; 'sel' = the bit
-    elimination runs inside fit(); 'other' = the control on eliminated bits."""
-    if family in ("lr_l1", "lr_l2"):  # LR on all products of up to deg distinct bits
+    """Build any model. p: JSON-friendly hyper-parameters. cond is 'all' (every model uses all
+    bits) or, for the weighted kernel, 'reversed' (the control with weights on the wrong bits)."""
+    if family == "lr_l2":  # LR (L2 penalty) on all products of up to deg distinct bits
         est = Pipeline(
             [
                 ("poly", PolynomialFeatures(p["deg"], interaction_only=True, include_bias=False)),
-                ("lr", lr_clf(family[-2:], p["C"])),
+                ("lr", LogisticRegression(C=p["C"], max_iter=300)),
             ]
         )
     elif family == "kpoly":
         est = KernelPolyLR(p["deg"], p["C"])
+    elif family == "wkpoly":
+        est = WeightedKernelLR(p["deg"], p["C"], "reversed" if cond == "reversed" else "forest")
+    elif family == "ukpoly":
+        est = WeightedKernelLR(p["deg"], p["C"], "equal")
     elif family == "rf":
         est = RandomForestClassifier(
             G["RF_TREES"],
@@ -486,7 +509,7 @@ def make_estimator(family, p, cond="all"):
         est = PaperBaseline()
     else:
         raise ValueError(family)
-    return est if cond == "all" else BitModel(est, other=cond == "other")
+    return est
 
 
 def test_kernel():
@@ -526,9 +549,8 @@ def acc(m, X, y):
 
 def _capped(est):
     """True if the fit stopped at its iteration cap instead of converging."""
-    m = est.base if isinstance(est, BitModel) else est
-    m = m.steps[-1][1] if isinstance(m, Pipeline) else m
-    if isinstance(m, KernelPolyLR):
+    m = est.steps[-1][1] if isinstance(est, Pipeline) else est
+    if isinstance(m, (KernelPolyLR, WeightedKernelLR)):
         return m.iters_ >= m.maxiter
     if isinstance(m, (LogisticRegression, MLPClassifier)):
         return int(np.max(m.n_iter_)) >= m.max_iter
@@ -612,12 +634,11 @@ def groups(n):
     """One entry per (family, condition, sub-model) with its CV-best setting, best first."""
     d = {}
     for r in CV.rows.values():
-        if r["n"] == n and len(r["folds"]) == K and r["family"] in NAME:  # skip cut models
+        if r["n"] == n and len(r["folds"]) == K and r["family"] in NAME and r["cond"] == "all":
             d.setdefault((r["family"], r["cond"], r["sub"]), []).append(r)
-    pref = {"all": 0, "sel": 1}  # exact ties: all-bits first
     return sorted(
         [dict(key=k, best=max(rs, key=lambda r: r["mean"]), configs=rs) for k, rs in d.items()],
-        key=lambda g: (-round(g["best"]["mean"], 9), pref[g["key"][1]]),
+        key=lambda g: -round(g["best"]["mean"], 9),
     )
 
 
@@ -640,7 +661,7 @@ def jaccard_mean(sets):
     return float(np.mean(v)) if v else float("nan")
 
 
-def best_of(n, cond, fams=("lr_l1", "lr_l2"), sub=None):
+def best_of(n, cond, fams=("lr_l2",), sub=None):
     """The CV-best group among these families on these bits (optionally one sub-model)."""
     return next(
         g
@@ -703,11 +724,9 @@ def kernel_label(i):
 def table_degree_all():
     """Polynomial LR on all bits by degree: explicit monomials, then the paper's kernel."""
     blank = [""] * (len(NS) + 1)
-    rows = [["Explicit monomials (best penalty and C per degree)"] + [""] * len(NS)]
+    rows = [["Explicit monomials (best C per degree)"] + [""] * len(NS)]
     for d in range(1, max(G["MAX_DEG"].values()) + 1):
-        rows.append(
-            [f"    degree {d}"] + [_mean_sd(n, "all", ("lr_l1", "lr_l2"), f"deg{d}") for n in NS]
-        )
+        rows.append([f"    degree {d}"] + [_mean_sd(n, "all", ("lr_l2",), f"deg{d}") for n in NS])
     rows += [blank, [f"The paper's kernel (C = {G['KP_C']})"] + [""] * len(NS)]
     last = len(G["KP_DEGS"][NS[0]]) - 1
     for i in range(last + 1):
@@ -735,7 +754,7 @@ def table_families():
         ["Random forest"] + [_mean_sd(n, "all", ("rf",)) for n in NS],
         ["MLP 4×512"] + [_mean_sd(n, "all", ("mlp",)) for n in NS],
         ["Best polynomial LR, for reference"]
-        + [_mean_sd(n, "all", ("lr_l1", "lr_l2", "kpoly")) for n in NS],
+        + [_mean_sd(n, "all", ("lr_l2", "kpoly")) for n in NS],
     ]
     grid("Trained from scratch on all bits: CV accuracy (mean ± sd over folds)", rows)
     for n in NS:
@@ -743,49 +762,49 @@ def table_families():
         print(f"n = {n}: best forest has {show_params(g['best']['params'])}")
 
 
-def table_elimination():
-    """What the elimination keeps in every fold, and the held-out accuracy around the kept set."""
-    paths = {n: fold_paths(n) for n in NS}
-    kept = {n: [choose_bits(p, FOLD_TRAIN[n]) for p in paths[n]] for n in NS}
+def table_weights():
+    """How clearly the forest's weights single out a few bits."""
+    W = {n: fold_weights(n) for n in NS}
 
-    def oob(n, size):
-        """Mean held-out accuracy over folds of the set with size(kept) bits."""
-        vals = []
-        for p, k in zip(paths[n], kept[n]):
-            vals += [a for bits, a in p if len(bits) == size(k)]
-        return f"{np.mean(vals):.3f}" if vals else "-"
+    def mean(f):
+        return [f"{np.mean([f(np.sort(w)[::-1]) for w in W[n]]):.3f}" for n in NS]
 
     rows = [
-        ["Bits kept (mean over folds)"] + [f"{np.mean([len(k) for k in kept[n]]):.1f}" for n in NS],
-        ["Overlap of the kept bits between folds (Jaccard)"]
-        + [f"{jaccard_mean(kept[n]):.2f}" for n in NS],
-        ["Forest accuracy with all bits"] + [oob(n, lambda k, n=n: n) for n in NS],
-        ["Forest accuracy with the kept bits"] + [oob(n, len) for n in NS],
-        ["Forest accuracy with one bit fewer"] + [oob(n, lambda k: len(k) - 1) for n in NS],
+        ["10 largest weights on the same bits in every fold"]
+        + ["yes" if len({tuple(top_bits(w)) for w in W[n]}) == 1 else "no" for n in NS],
+        ["Share of the total weight on those 10 bits"] + mean(lambda w: w[:10].sum() / w.sum()),
+        ["Bits with weight 0 (left out of the kernel)"]
+        + [f"{np.mean([(w == 0).sum() for w in W[n]]):.1f}" for n in NS],
     ]
-    for seed in G["ELIM_SEEDS"]:
-        same = [
-            sum(choose_bits(p, FOLD_TRAIN[n]) == k for p, k in zip(fold_paths(n, seed), kept[n]))
-            for n in NS
-        ]
-        rows.append(
-            [f"Forest seed {seed}: folds that keep the same bits"] + [f"{v} of {K}" for v in same]
-        )
     grid(
-        "Recursive elimination of bits with a random forest (training rows of each fold)",
+        "Bit weights from one random forest per training fold (permutation importance)",
         rows,
-        "Forest accuracy: on the quarter of each fold's training rows held out inside the"
-        "\nelimination, mean over folds.",
+        "Negative importances are set to 0, then the largest weight is scaled to 1; mean over"
+        " folds.",
     )
+    for n in NS:
+        print(f"n = {n}: the 10 bits with the largest weights in fold 1: {top_bits(W[n][0])}")
 
 
-def table_degree_sel():
-    """Polynomial LR on the kept bits by degree."""
-    rows = [
-        [f"degree {d}"] + [_mean_sd(n, "sel", ("lr_l2",), f"deg{d}") for n in NS]
-        for d in G["SEL_DEGS"]
+def table_weighted_kernel():
+    """The same polynomial kernel with equal and with forest weights, by degree."""
+    rows = [["Equal weights"] + [""] * len(NS)]
+    rows += [
+        [f"    degree {d}"] + [_mean_sd(n, "all", ("ukpoly",), f"deg{d}") for n in NS]
+        for d in G["WK_DEGS"]
     ]
-    grid("Polynomial LR on the kept bits: CV accuracy by degree (mean ± sd over folds)", rows)
+    rows += [[""] * (len(NS) + 1), ["Forest weights (best C per degree)"] + [""] * len(NS)]
+    rows += [
+        [f"    degree {d}"] + [_mean_sd(n, "all", ("wkpoly",), f"deg{d}") for n in NS]
+        for d in G["WK_DEGS"]
+    ]
+    best = {n: best_of(n, "all", ("wkpoly",))["best"] for n in NS}
+    rows.append(
+        ["        training accuracy, best setting"] + [f"{best[n]['train']:.3f}" for n in NS]
+    )
+    grid("Polynomial kernel LR on all bits: CV accuracy by degree (mean ± sd over folds)", rows)
+    for n in NS:
+        print(f"n = {n}: best weighted setting {show_params(best[n]['params'])}")
 
 
 def summary_rows(final):
@@ -804,9 +823,9 @@ def summary_rows(final):
         (
             "row",
             "Explicit monomials, best degree",
-            [b["mean"] for b in best("all", ("lr_l1", "lr_l2"))],
+            [b["mean"] for b in best("all", ("lr_l2",))],
         ),
-        ("deg", "degree", degree("all", ("lr_l1", "lr_l2"))),
+        ("deg", "degree", degree("all", ("lr_l2",))),
         ("row", "Paper's kernel, best degree", [b["mean"] for b in best("all", ("kpoly",))]),
         ("deg", "degree", degree("all", ("kpoly",))),
         ("group", "Trained from scratch on all bits"),
@@ -814,9 +833,19 @@ def summary_rows(final):
     ]
     if all(CV.where(n=n, family="mlp", exp="MLP") for n in NS):
         rows.append(("row", NAME["mlp"], [b["mean"] for b in best("all", ("mlp",))]))
-    rows.append(("group", "Polynomial LR on the bits kept by the forest"))
-    for d in [d for d in (2, 4, 6, 10) if d in G["SEL_DEGS"]]:
-        rows.append(("row", f"Degree {d}", [b["mean"] for b in best("sel", ("lr_l2",), f"deg{d}")]))
+    rows.append(("group", "Polynomial kernel on all bits, forest-weighted"))
+    rows.append(
+        ("row", "Equal weights, best degree", [b["mean"] for b in best("all", ("ukpoly",))])
+    )
+    rows.append(("deg", "degree", degree("all", ("ukpoly",))))
+    for d in G["WK_DEGS"]:
+        rows.append(
+            (
+                "row",
+                f"Forest weights, degree {d}",
+                [b["mean"] for b in best("all", ("wkpoly",), f"deg{d}")],
+            )
+        )
     rows += [
         ("group", "Final pipeline on the locked test rows"),
         ("row", "Locked test accuracy", [locked_score(final, n)["mean"] for n in NS]),
@@ -829,23 +858,6 @@ def summary_rows(final):
         f"in memory); kernel {kp}.",
     ]
     return rows, notes
-
-
-def table_summary(final):
-    """The summary as plain text."""
-    rows, notes = summary_rows(final)
-    out = []
-    for r in rows:
-        if r[0] == "group":
-            if out:
-                out.append([""] * (len(NS) + 1))
-            out.append([r[1]] + [""] * len(NS))
-        else:
-            fmt = "d" if r[0] == "deg" else ".3f"
-            out.append(
-                [("        " if r[0] == "deg" else "    ") + r[1]] + [format(v, fmt) for v in r[2]]
-            )
-    grid("Summary: accuracy of each approach", out, "\n".join(notes))
 
 
 def table_final(final):
@@ -863,9 +875,10 @@ def table_final(final):
         ],
         ["Control: shuffled training labels"]
         + [f"{FIN.rows[f'shuffle|{n}']['mean']:.3f}" for n in NS],
-        ["Control: same model on eliminated bits"]
+        ["Control: forest weights moved to the wrong bits"]
         + [
-            f"{FIN.rows[f'other|{n}']['mean']:.3f}" if f"other|{n}" in FIN.rows else "-" for n in NS
+            f"{FIN.rows[f'reversed|{n}']['mean']:.3f}" if f"reversed|{n}" in FIN.rows else "-"
+            for n in NS
         ],
     ]
     others = [
@@ -945,8 +958,8 @@ def fig_summary_table(final):
     def rule(y, lw):
         ax.plot([0, 1], [y, y], color=INK, lw=lw, solid_capstyle="butt", clip_on=False)
 
-    for i, g in enumerate(group_of, start=1):  # tint the models that use the kept bits
-        if "bits kept" in rows[g][1]:
+    for i, g in enumerate(group_of, start=1):  # tint the forest-weighted kernel rows
+        if "forest-weighted" in rows[g][1]:
             ax.axhspan(i - 0.5, i + 0.5, color=VIOLET, alpha=0.1, lw=0)
     rule(-0.5, 1.2)
     for c, n in enumerate(NS):
@@ -971,18 +984,19 @@ def fig_summary_table(final):
 
 
 def fig_degree():
-    """CV accuracy against the polynomial degree: explicit monomials and the paper's kernel on all
-    bits, explicit monomials on the kept bits."""
+    """CV accuracy against the polynomial degree on all bits: explicit monomials, the paper's
+    kernel, and the polynomial kernel with equal and with forest weights."""
     fig, axes = plt.subplots(1, 3, figsize=(6.75, 2.8), sharey=True, layout="constrained")
     series = (  # drawn in this order, so LR on all bits stays visible where the two LR lines meet
-        ("LR on the kept bits", VIOLET, "s", "sel", ("lr_l2",), lambda n: G["SEL_DEGS"]),
-        ("Kernel LR on all bits", ORANGE, "D", "all", ("kpoly",), lambda n: G["KP_DEGS"][n]),
+        ("Kernel, forest weights", VIOLET, "s", "all", ("wkpoly",), lambda n: G["WK_DEGS"]),
+        ("Kernel, equal weights", GRAY, "^", "all", ("ukpoly",), lambda n: G["WK_DEGS"]),
+        ("Paper's kernel", ORANGE, "D", "all", ("kpoly",), lambda n: G["KP_DEGS"][n]),
         (
             "LR on all bits",
             BLUE,
             "o",
             "all",
-            ("lr_l1", "lr_l2"),
+            ("lr_l2",),
             lambda n: range(1, G["MAX_DEG"][n] + 1),
         ),
     )
@@ -1008,27 +1022,30 @@ def fig_degree():
     print("Mean over the folds (shaded: one sd), best setting at each degree.")
 
 
-def fig_elimination():
-    """Held-out accuracy of the forest against the number of bits still in, one line per fold."""
-    fig, axes = plt.subplots(1, 3, figsize=(6.75, 2.5), sharey=True, layout="constrained")
+def fig_weights():
+    """The forest's weight of every bit, mean over folds (bars) and the spread over folds."""
+    fig, axes = plt.subplots(3, 1, figsize=(6.75, 4.2), layout="constrained")
     for ax, n in zip(axes, NS):
-        paths = fold_paths(n)
-        for p in paths:
-            ax.plot([len(b) for b, _ in p], [a for _, a in p], color=VIOLET, lw=1.2, alpha=0.6)
-        kept = [len(choose_bits(p, FOLD_TRAIN[n])) for p in paths]
-        ax.axvline(np.mean(kept), color=GRAY, ls="--", lw=1.3)
-        ax.axhline(0.5, color=GRAY, ls=":", lw=1)
-        ax.set_title(f"n = {n}")
-        ax.set_xlabel("bits still in")
-        ax.set_xlim(n + 1, 0)
-        ax.set_ylim(0.40, 1.0)
-    axes[0].set_ylabel("held-out accuracy")
-    savefig(fig, "fig_elimination")
-    print("One line per fold; bits are removed from left to right. Dashed: bits kept. Dotted: 0.5.")
+        W = np.array(fold_weights(n))
+        m, lo, hi = W.mean(0), W.min(0), W.max(0)
+        top = set(top_bits(m))
+        cols = [VIOLET if i in top else "#cfcec9" for i in range(n)]
+        ax.bar(range(n), m, color=cols, width=0.8)
+        ax.errorbar(range(n), m, yerr=[m - lo, hi - m], fmt="none", ecolor=INK, lw=0.8)
+        ax.set_xlim(-0.7, n - 0.3)
+        ax.set_xticks(range(0, n, 5))
+        ax.set_ylim(0, 1.1)
+        ax.set_ylabel(f"n = {n}")
+        ax.grid(axis="x", alpha=0)
+    axes[-1].set_xlabel("bit index")
+    savefig(fig, "fig_weights")
+    print(
+        "Bars: mean weight over folds (violet: the 10 largest); whiskers: smallest to largest fold."
+    )
 
 
 LOOK = dict(  # label, colour and marker of each learning curve
-    sel=("LR on the kept bits", VIOLET, "s"),
+    wkpoly=("Kernel, forest weights", VIOLET, "s"),
     lr=("LR on all bits", BLUE, "o"),
     rf=("Random forest on all bits", AQUA, "^"),
     mlp=("MLP 4×512 on all bits", MAGENTA, "v"),
@@ -1044,7 +1061,7 @@ def fig_learning_curves(cands):
             rs = sorted(LC.where(n=n, family=fam, cond=cond, sub=sub), key=lambda r: r["size"])
             S = [r["size"] for r in rs]
             m, s = np.array([r["mean"] for r in rs]), np.array([r["sd"] for r in rs])
-            label, col, mk = LOOK["sel" if cond == "sel" else fam[:2] if fam[:2] == "lr" else fam]
+            label, col, mk = LOOK["lr" if fam.startswith("lr") else fam]
             ax.plot(S, m, marker=mk, ms=4, color=col, label=label)
             ax.fill_between(S, m - s, m + s, color=col, alpha=0.15, lw=0)
         ax.axhline(0.5, color=GRAY, ls=":", lw=1)
@@ -1073,12 +1090,17 @@ def choose_final():
 
 def run_learning_curves():
     """Train the best model of each kind on nested random subsets of the training folds and score
-    it on the held-out fold. For LR, C multiplies the summed loss, so the same C penalises more
-    strongly with fewer rows; C is scaled by (full rows / rows used) to keep the penalty per row
-    fixed. Returns the models per n."""
+    it on the held-out fold; the weighted kernel computes its weights on the subset. For LR and
+    the kernels, C multiplies the summed loss, so the same C penalises more strongly with fewer
+    rows; C is scaled by (full rows / rows used) to keep the penalty per row fixed. Returns the
+    models per n."""
     cands = {}
     for n in NS:
-        cands[n] = [best_of(n, "sel"), best_of(n, "all"), best_of(n, "all", ("rf",))]
+        cands[n] = [
+            best_of(n, "all", ("wkpoly",)),
+            best_of(n, "all"),
+            best_of(n, "all", ("rf",)),
+        ]
         if CV.where(n=n, family="mlp", exp="MLP"):
             cands[n].append(best_of(n, "all", ("mlp",)))
         for g in cands[n]:
@@ -1129,7 +1151,7 @@ def locked_score(final, n):
             n_test=int(len(te)),
             train=acc(est, B[tr], y[tr]),
             half=binomial_half(a, len(te)),
-            bits=est.cols_ if cond == "sel" else None,
+            top_bits=top_bits(est.w_) if hasattr(est, "w_") else None,
             params=p,
         )
 
@@ -1139,8 +1161,8 @@ def locked_score(final, n):
 
 def run_controls(final):
     """Two controls for the final pipeline on the first folds, both expected at about 0.5: shuffled
-    training labels (otherwise something leaks), and the same model on as many eliminated bits
-    (otherwise the kept bits are not what carries the label)."""
+    training labels (otherwise something leaks), and for the weighted kernel the same weights
+    moved to the wrong bits (otherwise the weights are not what makes it work)."""
     for n in NS:
         fam, cond, sub = final[n]["key"]
         p = final[n]["best"]["params"]
@@ -1157,11 +1179,11 @@ def run_controls(final):
         assert (
             abs(r["mean"] - 0.5) < 0.03
         ), f"n={n}: shuffled-label accuracy {r['mean']:.3f}, possible leakage"
-        if cond == "sel":
+        if fam == "wkpoly":
             run(
                 FIN,
-                f"other|{n}",
-                lambda: cv_eval(lambda: make_estimator(fam, p, "other"), n, folds=G["LC_FOLDS"]),
+                f"reversed|{n}",
+                lambda: cv_eval(lambda: make_estimator(fam, p, "reversed"), n, folds=G["LC_FOLDS"]),
                 quiet=True,
                 **meta,
             )
@@ -1178,13 +1200,15 @@ def predict_hidden(final):
         Xh = np.load(f"{DATA}/hidden-kryptonite-{n}-X.npy")
         Bh = np.where(Xh > 0, 1.0, -1.0).astype(np.float32)
         p = final[n]["best"]["params"]
-        good = [g for g in groups(n) if g["best"]["mean"] > 0.9 and g["key"][1] != cond]
+        good = [g for g in groups(n) if g["best"]["mean"] > 0.9 and g["key"][0] != fam]
         alt = good[0] if good else None
 
         def job():
             t0 = time.time()
             est = make_estimator(fam, p, cond).fit(B, y)
-            out = dict(pred=est.predict(Bh).tolist(), bits=getattr(est, "cols_", None))
+            out = dict(pred=est.predict(Bh).tolist())
+            if hasattr(est, "w_"):
+                out["top_bits"] = top_bits(est.w_)
             if alt:
                 m = make_estimator(alt["key"][0], alt["best"]["params"], alt["key"][1]).fit(B, y)
                 out["alt"] = m.predict(Bh).tolist()
@@ -1202,7 +1226,7 @@ def predict_hidden(final):
             np.mean(np.abs(Xh - Bh) < 0.5) > 0.999
         ), "hidden inputs are not clean +-1 bits plus small noise"
         msg = f"n={n}: {kname(final[n]['key'])}, predicted positive rate {pred.mean():.3f}"
-        # The best model of another kind (other bits) must mostly agree. If each errs on a share e
+        # The best model of another kind must mostly agree. If each errs on a share e
         # of rows, they can disagree on at most e1 + e2 of them; 0.02 allows for sampling noise.
         if alt:
             agree = float((np.array(h["alt"]) == pred).mean())
@@ -1241,9 +1265,7 @@ GRID_G_PER_KWH = 125  # NESO, "Britain's Electricity Explained: 2024 Review": GB
 def carbon_report():
     """Energy measured by CodeCarbon for every stored result, by experiment, and the emissions at
     GRID_G_PER_KWH."""
-    rows = [r for st in (CV, LC, SEL, FIN) for r in st.rows.values()]
-    dropped = [r for r in rows if r.get("family") == "kmeans" and r.get("energy")]
-    rows = [r for r in rows if r.get("family") != "kmeans"]  # cut from the notebook, see below
+    rows = [r for st in (CV, LC, WTS, FIN) for r in st.rows.values()]
     missing = [r for r in rows if "energy" not in r]
     rows = [r for r in rows if r.get("energy")]
     modes = {r["energy"]["cpu_mode"] for r in rows}
@@ -1262,16 +1284,16 @@ def carbon_report():
         FOLD="MLP 4×512",
         MLP="MLP 4×512",
         LC="Learning curves",
+        UK="Kernel on all bits, equal weights",
+        WK="Kernel on all bits, forest weights",
         CONTROL="Final pipeline: controls and locked test",
         FINAL="Final pipeline: controls and locked test",
         HIDDEN="Hidden-set refits",
     )
 
     def name(r):
-        if r.get("exp") == "ELIM":
-            return "Bit elimination" + (" (stability check)" if r.get("seed", SEED) != SEED else "")
-        if r.get("exp") == "LR" and r.get("cond") == "sel":
-            return "Polynomial LR on the kept bits"
+        if r.get("exp") == "WTS":
+            return "Bit weights"
         return names.get(r.get("exp"), str(r.get("exp")))
 
     tot = {}
@@ -1285,31 +1307,33 @@ def carbon_report():
 
     out = [line(k, v) for k, v in tot.items()] + [line("Total", total)]
     text_table(["", "hours", "CPU Wh", "g CO2e"], out, "Measured CPU energy by experiment")
+    cpus = {r["energy"].get("cpu") for r in rows} - {None}
+    if not cpus:  # results stored before the CPU name was recorded: ask CodeCarbon now
+        tr = _tracker()[0]
+        tr.start_task()
+        cpus = {tr.stop_task().cpu_model}
     print(
-        f"Read from the CPU's energy counters ({', '.join(sorted(modes))}), whole package. Every"
-        " model runs on the CPU only,\nso no GPU energy is counted; RAM and screen are not"
-        f" measured. g CO2e at {GRID_G_PER_KWH} g per kWh (NESO, GB 2024 average)."
+        f"CPU: {', '.join(sorted(cpus))}; energy read from its own counters"
+        f" ({', '.join(sorted(modes))}).\nEvery model runs on the CPU only, so no GPU energy is"
+        " counted; RAM and screen are not measured.\ng CO2e at"
+        f" {GRID_G_PER_KWH} g per kWh (NESO, GB 2024 average)."
     )
-    if dropped:
-        wh = sum(r["energy"]["cpu_kwh"] * 1000 for r in dropped)
-        print(f"Not included: {len(dropped)} K-means results from an earlier version, {wh:.1f} Wh.")
 
     def cv_cost(pick):
         return sum(r["energy"]["cpu_kwh"] * 1000 for r in rows if pick(r))
 
     for n in NS:
-        sel = cv_cost(
+        wk = cv_cost(
             lambda r: r.get("n") == n
             and (
-                r.get("exp") == "ELIM"
+                r.get("exp") == "WTS"
                 and r.get("seed", SEED) == SEED
                 and r.get("rows") == FOLD_TRAIN[n]
-                or r.get("exp") == "LR"
-                and r.get("cond") == "sel"
+                or r.get("exp") == "WK"
             )
         )
         mlp = cv_cost(lambda r: r.get("n") == n and r.get("exp") in ("FOLD", "MLP"))
         print(
-            f"n = {n}: {K}-fold CV of the kept-bits pipeline (elimination + LR grid) {sel:.1f} Wh;"
+            f"n = {n}: {K}-fold CV of the weighted kernel (weights + its grid) {wk:.1f} Wh;"
             f" of the MLP {mlp:.1f} Wh"
         )
