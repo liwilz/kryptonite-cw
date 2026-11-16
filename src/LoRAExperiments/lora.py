@@ -3,7 +3,7 @@
 Usage:
     from kryptonet import load_kryptonet
     from lora import add_lora, count_trainable
-    model = add_lora(load_kryptonet("kryptonet40.pt"), r=8, layers=(1, 2, 3, 4))
+    model = add_lora(load_kryptonet("kryptonet40.pt"), r=8, alpha=8.0, layers=(1, 2, 3, 4))
     count_trainable(model)    # only the A and B matrices of W_1, ..., W_4 are trained
 """
 import copy
@@ -23,7 +23,7 @@ class LoRALinear(nn.Module):
     x (W + (alpha / r) B A)^T instead, to compare the cost of the two orders.
     """
 
-    def __init__(self, base, r, alpha=8.0, merged=False):
+    def __init__(self, base, r, alpha, merged=False):
         super().__init__()
         self.base, self.r, self.scale, self.merged = base, r, alpha / r, merged
         for p in base.parameters():
@@ -40,7 +40,7 @@ class LoRALinear(nn.Module):
         return self.base(x) + self.scale * (x @ self.A.T) @ self.B.T
 
 
-def add_lora(model, r, layers=(1, 2, 3, 4), alpha=8.0, train_head=False, merged=False):
+def add_lora(model, r, alpha, layers=(1, 2, 3, 4), train_head=False, merged=False):
     """A copy of KryptoNet with LoRA on W_l for l in `layers` (numbered 1 to 5 as in the paper), all else frozen."""
     model = copy.deepcopy(model)
     for p in model.parameters():
