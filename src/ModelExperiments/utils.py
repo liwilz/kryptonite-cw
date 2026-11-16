@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.pipeline import Pipeline
+from sklearn.neural_network import MLPClassifier
 
 # ---- Settings. KRYP_QUICK=1 runs a tiny dry run (see the end of this block); its numbers mean
 # nothing.
@@ -21,7 +21,7 @@ QUICK = os.environ.get("KRYP_QUICK", "0") == "1"
 ROOT = next((p for p in (".", "..", "../..", "../../..") if os.path.isdir(f"{p}/Datasets")), ".")
 DATA, HIDDEN = f"{ROOT}/Datasets", f"{ROOT}/hiddenlabels"
 NS = (20, 30, 40)
-SEED = 0  # fixes the locked split, the folds and every model
+SEED = 0  # fixes the test split, the folds and every model
 K = 5  # CV folds
 ROWS = None  # None = all labelled rows
 OUT, FIG = "exp_cache", "exp_figures"  # OUT only lets an interrupted run resume
@@ -29,9 +29,7 @@ WRITE_PREDICTIONS = True
 RUN_MLP = True  # the 4 x 512 MLP, the slowest experiment
 
 G = dict(
-    C_L2=[1e-3, 1e-2, 1e-1, 1],
-    MAX_DEG={20: 4, 30: 3, 40: 2},  # largest degree whose monomials on all bits fit in memory
-    KP_DEGS={n: [6, 10, 15, n, 2 * n] for n in NS},  # degrees of the paper's kernel
+    KP_DEGS={n: [10, 2 * n] for n in NS},  # the paper's kernel: its highest degree, and 2n
     KP_C=0.85,
     RF_TREES=200,
     RF_MAXF=["sqrt", 0.5, 1.0],
@@ -47,17 +45,14 @@ G = dict(
     LC_FOLDS=(0, 1, 2),
     # MLP ablations (Experiment 2), on LC_FOLDS: key -> (label, hidden layers, raw inputs?)
     MLP_ABLATIONS=dict(
-        raw=("4×512 on the raw inputs", [512, 512, 512, 512], True),
-        h1x512=("1×512 on the bits", [512], False),
-        h4x64=("4×64 on the bits", [64, 64, 64, 64], False),
+        raw=("Raw inputs instead of their signs", [512, 512, 512, 512], True),
+        h1x512=("One hidden layer of 512", [512], False),
+        h4x64=("Four hidden layers of 64", [64, 64, 64, 64], False),
     ),
 )
 if QUICK:  # dry run: 3 folds, 3,000 rows, small grids, separate folders, no predictions
     K, ROWS, OUT, FIG, WRITE_PREDICTIONS = 3, 3000, "exp_cache_quick", "exp_figures_quick", False
     G.update(
-        C_L2=[1e-2, 1e-1],
-        MAX_DEG={20: 2, 30: 2, 40: 2},
-        KP_DEGS={n: [10, n] for n in NS},
         RF_TREES=30,
         RF_MAXF=["sqrt", 1.0],
         RF_LEAF=[5],
@@ -84,13 +79,12 @@ warnings.filterwarnings("ignore", message=".*encountered in matmul")
 
 # ---- Names used in tables and figures
 NAME = dict(
-    lr_l2="LR, L2",
-    kpoly="Kernel LR",
-    wkpoly="Weighted kernel LR",
-    ukpoly="Equal-weight kernel LR",
+    paper="Baseline (degree 2, raw inputs)",
+    kpoly="Their kernel",
     rf="Random forest",
-    mlp="MLP 4×512",
-    paper="Paper baseline",
+    mlp="MLP",
+    ukpoly="Equal-weight kernel",
+    wkpoly="MANBAT",
 )
 
 
@@ -102,7 +96,7 @@ def kname(key):
 
 def show_params(p):
     """{"deg": 4, "C": 0.01} -> "degree 4, C 0.01"."""
-    names = dict(deg="degree", h="layers", max_features="max features", msl="min leaf")
+    names = dict(deg="degree", h="layers", max_features="inputs per split", msl="min leaf")
     out = []
     for k, v in (p or {}).items():
         v = f"{len(v)}×{v[0]}" if k == "h" else v
@@ -110,7 +104,7 @@ def show_params(p):
     return ", ".join(out)
 
 
-# ---- Data and splits: a locked 20% test set and K stratified folds on the other 80% (dev)
+# ---- Data and splits: a 20% test set and K stratified folds on the other 80% (dev)
 _DATA = {}
 
 
@@ -133,7 +127,7 @@ DEV, FOLDS, LOCKED = {}, {}, {}
 for n in NS:
     X, B, y = load(n)
     dev, locked = train_test_split(np.arange(len(y)), test_size=0.2, random_state=SEED, stratify=y)
-    DEV[n], LOCKED[n] = dev, locked  # LOCKED is read only by the final test
+    DEV[n], LOCKED[n] = dev, locked  # LOCKED (the test set) is read only after every choice
     FOLDS[n] = [
         (dev[a], dev[b])
         for a, b in StratifiedKFold(K, shuffle=True, random_state=SEED).split(dev, y[dev])
@@ -142,11 +136,11 @@ FOLD_TRAIN = {n: len(FOLDS[n][0][0]) for n in NS}
 
 
 def check_protocol():
-    """Assert that the splits are valid and print their sizes."""
+    """Assert that the splits are valid, and print their sizes."""
     for n in NS:
         X, B, y = load(n)
         assert set(np.unique(y)) <= {0, 1}, "labels must be 0/1"
-        assert np.mean(np.abs(X - B) < 0.5) > 0.9999, "rounding to bits would lose information"
+        assert np.mean(np.abs(X - B) < 0.5) > 0.9999, "rounding to signs would lose information"
         assert not set(DEV[n]) & set(LOCKED[n]) and len(DEV[n]) + len(LOCKED[n]) == len(y)
         assert sorted(np.concatenate([va for _, va in FOLDS[n]])) == sorted(DEV[n])
         for tr, va in FOLDS[n]:
@@ -156,11 +150,21 @@ def check_protocol():
                 and not set(va) & set(LOCKED[n])
             )
             assert abs(y[tr].mean() - y.mean()) < 0.02 and abs(y[va].mean() - y.mean()) < 0.03
-        print(
-            f"n={n}: {len(y)} labelled rows = {len(DEV[n])} dev ({K} folds of {FOLD_TRAIN[n]} train"
-            f" / {len(FOLDS[n][0][1])} validation rows) + {len(LOCKED[n])} locked; {y.mean():.3f}"
-            f" positive; noise sd {np.std(X - B):.3f}"
-        )
+    sizes = {
+        n: (len(load(n)[2]), len(LOCKED[n]), len(FOLDS[n][0][0]), len(FOLDS[n][0][1])) for n in NS
+    }
+    grid(
+        "Data and splits (all checks passed)",
+        [
+            ["Labelled rows"] + [f"{sizes[n][0]:,}" for n in NS],
+            ["Test set (20%)"] + [f"{sizes[n][1]:,}" for n in NS],
+            [f"Per fold ({K} folds): training rows"] + [f"{sizes[n][2]:,}" for n in NS],
+            ["                      validation rows"] + [f"{sizes[n][3]:,}" for n in NS],
+            ["Positive labels"] + [f"{pct(load(n)[2].mean())}%" for n in NS],
+            ["Noise sd (input minus its sign)"]
+            + [f"{np.std(load(n)[0] - load(n)[1]):.3f}" for n in NS],
+        ],
+    )
 
 
 # ---- Result store: one JSON line per finished result, so an interrupted run resumes
@@ -263,12 +267,11 @@ def acc(m, X, y):
 
 def _capped(est):
     """True if the fit stopped at its iteration cap instead of converging."""
-    m = est.steps[-1][1] if isinstance(est, Pipeline) else est
-    if hasattr(m, "iters_"):  # the kernel models
-        return m.iters_ >= m.maxiter
-    if hasattr(m, "n_iter_") and hasattr(m, "max_iter"):  # LogisticRegression, MLPClassifier
-        return int(np.max(m.n_iter_)) >= m.max_iter
-    return False
+    if hasattr(est, "iters_"):  # the kernel models
+        return est.iters_ >= est.maxiter
+    if isinstance(est, MLPClassifier):
+        return est.n_iter_ >= est.max_iter
+    return False  # the forest has no iterations; the baseline keeps the paper's 100 SAG steps
 
 
 def cv_eval(make, n, fam="", size=None, folds=None, shuffle_labels=False, raw=False):
@@ -311,20 +314,13 @@ def groups(n):
     )
 
 
-def difference(a, b):
-    """Fold-by-fold accuracy difference a - b on the same folds: '+0.283 ± 0.012 (5 of 5)', the
-    mean ± sd over folds and the number of folds where a is better."""
-    d = np.asarray(a) - np.asarray(b)
-    return f"{d.mean():+.3f} ± {d.std(ddof=1):.3f} ({int((d > 0).sum())} of {len(d)})"
+def hoeffding_eps(m, delta=0.05):
+    """Half-width of the interval that holds the true accuracy with probability at least
+    1 - delta, from m independent test rows (the report's Eq. 7, by Hoeffding's inequality)."""
+    return float(np.sqrt(np.log(2 / delta) / (2 * m)))
 
 
-def binomial_half(p, N, z=1.96):
-    """Half-width of the 95% interval of an accuracy p measured on N independent test rows: each
-    row is right or wrong, so the count of correct rows is binomial with sd sqrt(p (1 - p) / N)."""
-    return float(z * np.sqrt(p * (1 - p) / N))
-
-
-def best_of(n, cond, fams=("lr_l2",), sub=None):
+def best_of(n, cond, fams, sub=None):
     """The CV-best group among these families on these bits (optionally one sub-model)."""
     return next(
         g
@@ -366,22 +362,19 @@ def grid(title, rows, note=None):
         print(note)
 
 
+def pct(a):
+    """An accuracy as a percentage: 0.9542 -> '95.4'."""
+    return f"{100 * a:.1f}"
+
+
 def ms(r):
-    return f"{r['mean']:.3f} ± {r['sd']:.3f}"
+    """'95.4 ± 0.8': mean ± sd over folds, in percent."""
+    return f"{pct(r['mean'])} ± {pct(r['sd'])}"
 
 
-def _mean_sd(n, cond, fams, sub=None):
-    """'0.675 ± 0.017' for the best such model, or '-' if it was not run."""
-    try:
-        return ms(best_of(n, cond, fams, sub)["best"])
-    except StopIteration:
-        return "-"
-
-
-def kernel_label(i):
-    """Name of the i-th kernel degree: a number, or 'n' / '2n' when it differs between datasets."""
-    degs = [G["KP_DEGS"][n][i] for n in NS]
-    return str(degs[0]) if len(set(degs)) == 1 else ("n" if degs[0] == NS[0] else "2n")
+def mean_sd(n, cond, fams, sub=None):
+    """'95.4 ± 0.8' for the CV-best setting of such a model."""
+    return ms(best_of(n, cond, fams, sub)["best"])
 
 
 # ---- Figures: drawn at their size in the report (one column 3.25 in, page width 6.75 in)
@@ -390,7 +383,7 @@ plt.rcParams.update(
         "font.size": 10,
         "axes.titlesize": 10,
         "axes.labelsize": 10,
-        "legend.fontsize": 9,
+        "legend.fontsize": 10,  # the rubric: no text smaller than the 10 pt body text
         "xtick.labelsize": 10,
         "ytick.labelsize": 10,
         "axes.spines.top": False,
@@ -432,4 +425,16 @@ def check_caps():
     if not rows:
         print("No fit stopped at its iteration cap.")
     for r in rows:
-        print(f"{r['key']}: {r['capped']} fold(s) stopped at the iteration cap")
+        what = ", ".join(
+            x
+            for x in (
+                NAME.get(r.get("family"), r.get("family")),
+                show_params(r.get("params")),
+                f"{r['size']} training rows" if "size" in r else "",
+            )
+            if x
+        )
+        print(
+            f"n = {r['n']}: {what}: {r['capped']} of {len(r['folds'])} folds stopped at the"
+            " iteration cap"
+        )

@@ -15,7 +15,6 @@ from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PolynomialFeatures
 
 from utils import CV, FOLDS, G, K, SEED, WTS, cv_eval, load, run
@@ -82,11 +81,11 @@ def paper_kernel_table(n, degree):
 
 
 class KernelPolyLR:
-    """Logistic regression with the paper's polynomial kernel (that of PolynomialFeatures(d) on the
-    bits), trained in the dual so the up to 2^n monomials are never built, only the N x N Gram
-    matrix. The penalty a'Ka / (2C) is sklearn's L2 penalty on the implicit weights, so C means
-    what it means in LogisticRegression. L-BFGS instead of the paper's Newton step allows
-    degrees above 10."""
+    """Logistic regression with the paper's polynomial kernel: the inner product of
+    PolynomialFeatures(d) on the bits, normalised so that k(x, x) = 1 as in the paper, plus an
+    unpenalised intercept (which the paper's model does not have). Trained in the dual, so only
+    the N x N Gram matrix is built, never the monomials; the penalty a'Ka / (2C) is sklearn's L2
+    penalty on the normalised features. L-BFGS instead of the paper's Newton's method."""
 
     def __init__(self, deg, C, maxiter=500):
         self.deg, self.C, self.maxiter = deg, C, maxiter
@@ -145,8 +144,9 @@ class KernelPolyLR:
 
 
 class WeightedKernelLR:
-    """Logistic regression with the polynomial kernel k(x, x') = ((1 + sum_i w_i x_i x'_i) /
-    (1 + sum_i w_i))^d, trained in the dual like KernelPolyLR. weights='forest': w is computed
+    """MANBAT: logistic regression with the polynomial kernel k(x, x') = ((1 + sum_i w_i x_i x'_i)
+    / (1 + sum_i w_i))^d, so that k(x, x) = 1, plus an unpenalised intercept, trained in the
+    dual like KernelPolyLR. weights='forest': w is computed
     inside fit() from the rows it is fitted on (bit_weights), so it never sees validation or
     test rows; 'equal': w = 1 for every bit; 'reversed': the forest's weights moved to the
     wrong bits (the largest weight on the least important bit), a control. The Gram matrix is
@@ -233,16 +233,9 @@ class PaperBaseline:
 
 
 def make_estimator(family, p, cond="all"):
-    """Build any model. p: JSON-friendly hyper-parameters. cond is 'all' (every model uses all
-    bits) or, for the weighted kernel, 'reversed' (the control with weights on the wrong bits)."""
-    if family == "lr_l2":  # LR (L2 penalty) on all products of up to deg distinct bits
-        est = Pipeline(
-            [
-                ("poly", PolynomialFeatures(p["deg"], interaction_only=True, include_bias=False)),
-                ("lr", LogisticRegression(C=p["C"], max_iter=300)),
-            ]
-        )
-    elif family == "kpoly":
+    """Build any model by name. p: JSON-friendly hyperparameters. cond is 'all' or, for MANBAT,
+    'reversed' (the control with the weights moved to the wrong bits)."""
+    if family == "kpoly":
         est = KernelPolyLR(p["deg"], p["C"])
     elif family == "wkpoly":
         est = WeightedKernelLR(p["deg"], p["C"], "reversed" if cond == "reversed" else "forest")

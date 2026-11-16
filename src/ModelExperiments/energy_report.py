@@ -5,7 +5,7 @@ experiment.
 
 import numpy as np
 
-from utils import CV, FIN, FOLD_TRAIN, K, LC, MEASURED, NS, SEED, WTS, _tracker, text_table
+from utils import CV, FIN, LC, MEASURED, WTS, _tracker, text_table
 
 GRID_G_PER_KWH = 125  # NESO, "Britain's Electricity Explained: 2024 Review": GB average for 2024
 
@@ -25,24 +25,23 @@ def carbon_report():
         )
         return
     names = dict(
-        BASE="Polynomial LR on all bits",
-        LR="Polynomial LR on all bits",
-        KPOLY="Kernel LR on all bits",
-        RF="Random forest on all bits",
+        BASE="Baseline (degree 2)",
+        KPOLY="Their kernel",
+        RF="Random forest",
         FOLD="MLP 4×512",
         MLP="MLP 4×512",
-        LC="Learning curves",
-        UK="Kernel on all bits, equal weights",
-        WK="Kernel on all bits, forest weights",
-        CONTROL="Final pipeline: controls and locked test",
-        FINAL="Final pipeline: controls and locked test",
-        HIDDEN="Hidden-set refits",
         ABL="MLP ablations",
+        WTS="MANBAT: bit weights",
+        WK="MANBAT",
+        UK="Equal-weight kernel",
+        LC="Learning curves",
+        CONTROL="Controls",
+        FINAL="Test scores",
+        TEST="Test scores",
+        HIDDEN="Hidden-set refits",
     )
 
     def name(r):
-        if r.get("exp") == "WTS":
-            return "Bit weights"
         return names.get(r.get("exp"), str(r.get("exp")))
 
     tot = {}
@@ -67,25 +66,6 @@ def carbon_report():
         " counted; RAM and screen are not measured.\ng CO2e at"
         f" {GRID_G_PER_KWH} g per kWh (NESO, GB 2024 average)."
     )
-
-    def cv_cost(pick):
-        return sum(r["energy"]["cpu_kwh"] * 1000 for r in rows if pick(r))
-
-    for n in NS:
-        wk = cv_cost(
-            lambda r: r.get("n") == n
-            and (
-                r.get("exp") == "WTS"
-                and r.get("seed", SEED) == SEED
-                and r.get("rows") == FOLD_TRAIN[n]
-                or r.get("exp") == "WK"
-            )
-        )
-        mlp = cv_cost(lambda r: r.get("n") == n and r.get("exp") in ("FOLD", "MLP"))
-        print(
-            f"n = {n}: {K}-fold CV of the weighted kernel (weights + its grid) {wk:.1f} Wh;"
-            f" of the MLP {mlp:.1f} Wh"
-        )
 
 
 if __name__ == "__main__":
