@@ -35,6 +35,7 @@ def carbon_report():
         WK="MANBAT",
         UK="Equal-weight kernel",
         LC="Learning curves",
+        LCT="Learning curves",
         CONTROL="Controls",
         FINAL="Test scores",
         TEST="Test scores",

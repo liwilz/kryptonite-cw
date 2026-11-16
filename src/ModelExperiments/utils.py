@@ -41,8 +41,9 @@ G = dict(
     WK_DEGS=[6, 10, 15],  # weighted polynomial kernel: degrees
     WK_C=[10, 100],  # and C, with forest weights
     WK_UNIFORM_C=10,  # C of the same kernel with equal weights, the comparison
-    LC_SIZES=[250, 500, 1000, 2000, 4000],  # learning curves; the full fold-train set is added
-    LC_FOLDS=(0, 1, 2),
+    LC_SIZES=[250, 500, 1000, 2000, 4000],  # learning curves; all non-test rows are added
+    LC_REPEATS=3,  # random subsets per size in the learning curves
+    LC_FOLDS=(0, 1, 2),  # the folds of the MLP ablations and the controls
     # MLP ablations (Experiment 2), on LC_FOLDS: key -> (label, hidden layers, raw inputs?)
     MLP_ABLATIONS=dict(
         raw=("Raw inputs instead of their signs", [512, 512, 512, 512], True),
@@ -61,6 +62,7 @@ if QUICK:  # dry run: 3 folds, 3,000 rows, small grids, separate folders, no pre
         WK_DEGS=[6, 10],
         WK_C=[10],
         LC_SIZES=[100, 250, 500],
+        LC_REPEATS=2,
         LC_FOLDS=(0, 1),
     )
 if not os.path.isfile(f"{DATA}/kryptonite-20-X.npy"):
@@ -434,7 +436,8 @@ def check_caps():
             )
             if x
         )
+        runs = "runs" if "size" in r else "folds"
         print(
-            f"n = {r['n']}: {what}: {r['capped']} of {len(r['folds'])} folds stopped at the"
+            f"n = {r['n']}: {what}: {r['capped']} of {len(r['folds'])} {runs} stopped at the"
             " iteration cap"
         )

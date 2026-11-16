@@ -1,16 +1,19 @@
-"""Experiment 4 (H3): learning curves. MANBAT, the paper's baseline, the random forest and the MLP,
-each at its CV-best setting, trained on nested random subsets of the training rows of the first
-three folds and scored on the fold's validation rows. Run after exp1 to exp3.
+"""Experiment 4 (H3): learning curves on the test set. MANBAT, the paper's baseline, the random
+forest and the MLP, each at its CV-best setting, are trained on random subsets of the non-test rows
+and scored on the test set. Nothing is chosen with these scores. Run after exp1 to exp3.
 
     python exp4_data_size.py"""
+
+import time
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 
+from final_pipeline import test_score
 from models import make_estimator
-from utils import AQUA, BLUE, CV, FOLD_TRAIN, LC, MAGENTA, NS, VIOLET, G, GRAY
-from utils import best_of, cv_eval, grid, pct, run, savefig
+from utils import AQUA, BLUE, CV, DEV, LC, LOCKED, MAGENTA, NS, SEED, VIOLET, G, GRAY
+from utils import _capped, acc, best_of, grid, load, pct, run, savefig
 
 LOOK = dict(  # label, colour and marker of each learning curve
     wkpoly=("MANBAT", VIOLET, "s"),
@@ -26,12 +29,33 @@ def main():
     table_learning_curves(cands)
 
 
+def test_eval(make, n, fam, size):
+    """Fit make() on LC_REPEATS random subsets of `size` non-test rows and score each on the test
+    set. The subsets are nested across sizes: the first `size` rows of one random order per
+    repeat."""
+    X, B, y = load(n)
+    M = X if fam == "paper" else B  # the baseline uses the raw inputs, as everywhere
+    t0, accs, capped = time.time(), [], 0
+    for r in range(G["LC_REPEATS"]):
+        tr = DEV[n][np.random.default_rng(SEED + r).permutation(len(DEV[n]))[:size]]
+        est = make().fit(M[tr], y[tr])
+        accs.append(acc(est, M[LOCKED[n]], y[LOCKED[n]]))
+        capped += bool(_capped(est))
+    return dict(
+        capped=capped,
+        folds=[round(a, 5) for a in accs],
+        mean=float(np.mean(accs)),
+        sd=float(np.std(accs, ddof=1)),
+        secs=round(time.time() - t0, 1),
+    )
+
+
 def run_learning_curves():
-    """Train each model on nested random subsets of the training folds (LC_FOLDS) and score it on
-    the held-out fold. MANBAT computes its weights on the subset. C multiplies the summed loss, so
-    for MANBAT it is scaled by (all training rows / rows used) to keep the penalty per row, lambda,
-    fixed; the baseline keeps the paper's C = 0.85, as in the paper's own experiment. The point at
-    all training rows is the ordinary CV score. Returns the models per n."""
+    """Train each model on random subsets of LC_SIZES non-test rows and score it on the test set.
+    MANBAT computes its weights on the subset. C multiplies the summed loss, so for MANBAT it is
+    scaled by (all non-test rows / rows used) to keep the penalty per row, lambda, at its value in
+    the final refit; the baseline keeps the paper's C = 0.85, as in the paper's own experiment. The
+    point at all non-test rows is the model's test score in Table 1. Returns the models per n."""
     cands = {}
     for n in NS:
         cands[n] = [best_of(n, "all", (fam,)) for fam in ("wkpoly", "paper", "rf")]
@@ -40,32 +64,24 @@ def run_learning_curves():
         for g in cands[n]:
             fam, cond, sub = g["key"]
             p = g["best"]["params"]
-            meta = dict(exp="LC", n=n, family=fam, cond=cond, sub=sub)
-            for size in [s for s in G["LC_SIZES"] if s < FOLD_TRAIN[n]]:
-                ps = dict(p, C=p["C"] * FOLD_TRAIN[n] / size) if fam == "wkpoly" else p
+            meta = dict(exp="LCT", n=n, family=fam, cond=cond, sub=sub)
+            for size in [s for s in G["LC_SIZES"] if s < len(DEV[n])]:
+                ps = dict(p, C=p["C"] * len(DEV[n]) / size) if fam == "wkpoly" else p
                 run(
                     LC,
-                    f"lc|{n}|{fam}|{cond}|{sub}|{size}",
-                    lambda: cv_eval(
-                        lambda: make_estimator(fam, ps, cond),
-                        n,
-                        fam=fam,  # the baseline uses the raw inputs, as in CV
-                        size=size,
-                        folds=G["LC_FOLDS"],
-                    ),
+                    f"lct|{n}|{fam}|{cond}|{sub}|{size}",
+                    lambda: test_eval(lambda: make_estimator(fam, ps, cond), n, fam, size),
                     quiet=True,
                     size=size,
                     **meta,
                 )
-            fr = [g["best"]["folds"][f] for f in G["LC_FOLDS"]]
+            t = test_score(n, g)["mean"]  # the refit on all non-test rows (Table 1)
             run(
                 LC,
-                f"lc|{n}|{fam}|{cond}|{sub}|{FOLD_TRAIN[n]}",
-                lambda: dict(
-                    folds=fr, mean=float(np.mean(fr)), sd=float(np.std(fr, ddof=1)), secs=0.0
-                ),
+                f"lct|{n}|{fam}|{cond}|{sub}|{len(DEV[n])}",
+                lambda: dict(folds=[t], mean=t, sd=0.0, secs=0.0),
                 quiet=True,
-                size=FOLD_TRAIN[n],
+                size=len(DEV[n]),
                 **meta,
             )
     return cands
@@ -74,12 +90,13 @@ def run_learning_curves():
 def curve(n, g):
     """The stored learning curve of one model: [(rows, mean, sd)], fewest rows first."""
     fam, cond, sub = g["key"]
-    rs = sorted(LC.where(n=n, family=fam, cond=cond, sub=sub), key=lambda r: r["size"])
+    rs = LC.where(exp="LCT", n=n, family=fam, cond=cond, sub=sub)
+    rs = sorted(rs, key=lambda r: r["size"])
     return [(r["size"], r["mean"], r["sd"]) for r in rs]
 
 
 def fig_learning_curves(cands):
-    """Held-out accuracy against the number of training rows."""
+    """Test accuracy against the number of training rows."""
     fig, axes = plt.subplots(1, 3, figsize=(6.75, 3.0), sharey=True, layout="constrained")
     for ax, n in zip(axes, NS):
         for g in cands[n]:
@@ -95,7 +112,7 @@ def fig_learning_curves(cands):
         ax.set_title(f"n = {n}")
         ax.set_xlabel("training rows")
         ax.set_ylim(0.40, 1.0)
-    axes[0].set_ylabel("held-out accuracy")
+    axes[0].set_ylabel("test accuracy")
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="outside lower center", ncol=2)
     savefig(fig, "fig_learning_curves")
@@ -105,7 +122,7 @@ def table_learning_curves(cands):
     """The numbers behind the figure that the report quotes."""
     rows = []
     for size in (250, 4000, "all"):
-        rows.append([f"{size} training rows" if size != "all" else "all training rows"] + [""] * 3)
+        rows.append([f"{size} training rows" if size != "all" else "all non-test rows"] + [""] * 3)
         for g in cands[NS[0]]:
             fam = g["key"][0]
             cells = []
@@ -115,10 +132,10 @@ def table_learning_curves(cands):
                 cells.append("-" if m is None else pct(m))
             rows.append([f"    {LOOK[fam][0]}"] + cells)
     grid(
-        "Learning curves: held-out accuracy (%), mean over folds "
-        f"{', '.join(str(f + 1) for f in G['LC_FOLDS'])}",
+        f"Learning curves: test accuracy (%), mean over {G['LC_REPEATS']} random subsets",
         rows,
-        "Figure: mean over these folds, shaded one sd; dotted line at 50%.",
+        "Figure: the same means, shaded one sd over the subsets; the last point of each curve is"
+        " the model's\ntest score in Table 1 (one refit on all non-test rows); dotted line at 50%.",
     )
 
 
