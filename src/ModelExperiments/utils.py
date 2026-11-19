@@ -318,7 +318,8 @@ def groups(n):
 
 def hoeffding_eps(m, delta=0.05):
     """Half-width of the interval that holds the true accuracy with probability at least
-    1 - delta, from m independent test rows (the report's Eq. 7, by Hoeffding's inequality)."""
+    1 - delta, from m independent test rows (the report's Section 2.5, by Hoeffding's
+    inequality)."""
     return float(np.sqrt(np.log(2 / delta) / (2 * m)))
 
 

@@ -55,7 +55,7 @@ def run_learning_curves():
     MANBAT computes its weights on the subset. C multiplies the summed loss, so for MANBAT it is
     scaled by (all non-test rows / rows used) to keep the penalty per row, lambda, at its value in
     the final refit; the baseline keeps the paper's C = 0.85, as in the paper's own experiment. The
-    point at all non-test rows is the model's test score in Table 1. Returns the models per n."""
+    point at all non-test rows is the model's test score in Table 2. Returns the models per n."""
     cands = {}
     for n in NS:
         cands[n] = [best_of(n, "all", (fam,)) for fam in ("wkpoly", "paper", "rf")]
@@ -75,7 +75,7 @@ def run_learning_curves():
                     size=size,
                     **meta,
                 )
-            t = test_score(n, g)["mean"]  # the refit on all non-test rows (Table 1)
+            t = test_score(n, g)["mean"]  # the refit on all non-test rows (Table 2)
             run(
                 LC,
                 f"lct|{n}|{fam}|{cond}|{sub}|{len(DEV[n])}",
@@ -137,7 +137,7 @@ def table_learning_curves(cands):
         f"Learning curves: test accuracy (%), mean over {G['LC_REPEATS']} random subsets",
         rows,
         "Figure: the same means, shaded one sd over the subsets; the last point of each curve is"
-        " the model's\ntest score in Table 1 (one refit on all non-test rows); dotted line at 50%.",
+        " the model's\ntest score in Table 2 (one refit on all non-test rows); dotted line at 50%.",
     )
 
 

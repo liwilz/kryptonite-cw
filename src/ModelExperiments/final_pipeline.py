@@ -1,5 +1,5 @@
 """The final model per n, chosen by CV; its controls; the test score of every model's chosen
-setting (the report's Table 1); and the hidden-set predictions. Run after exp1 to exp4.
+setting (the report's Table 2); and the hidden-set predictions. Run after exp1 to exp4.
 
     python final_pipeline.py"""
 
@@ -182,7 +182,8 @@ def predict_hidden(final):
 
 
 def table_final(final):
-    """The final model: CV, its test score with the interval of Eq. 7, and the two controls."""
+    """The final model: CV, its test score with the interval of the report's Section 2.5, and the
+    two controls."""
     lk = {n: test_score(n, final[n]) for n in NS}
     eps = {n: hoeffding_eps(lk[n]["n_test"]) for n in NS}
     rows = [
@@ -191,7 +192,7 @@ def table_final(final):
         ["CV accuracy (mean ± sd over folds)"] + [ms(final[n]["best"]) for n in NS],
         ["Test accuracy"] + [pct(lk[n]["mean"]) for n in NS],
         ["    test rows m"] + [str(lk[n]["n_test"]) for n in NS],
-        ["    epsilon (Eq. 7, delta = 0.05), points"] + [pct(eps[n]) for n in NS],
+        ["    epsilon (Section 2.5, delta = 0.05), points"] + [pct(eps[n]) for n in NS],
         ["    true accuracy at least, with prob. 95%"] + [pct(lk[n]["mean"] - eps[n]) for n in NS],
         ["Control: permuted training labels"] + [pct(FIN.rows[f"shuffle|{n}"]["mean"]) for n in NS],
         ["Control: MANBAT, weights on the wrong inputs"]
@@ -207,7 +208,7 @@ def table_final(final):
 
 
 def table1_groups(n):
-    """The rows of the report's Table 1: (label, the CV-best setting of that model)."""
+    """The rows of the report's Table 2: (label, the CV-best setting of that model)."""
     top = f"deg{G['KP_DEGS'][n][-1]}"
     rows = [
         ("Baseline (degree 2, raw inputs)", best_of(n, "all", ("paper",))),
@@ -224,7 +225,7 @@ def table1_groups(n):
 
 
 def table1(final):
-    """The report's Table 1, in percent: the CV mean ± sd of every model's CV-best setting; their
+    """The report's Table 2, in percent: the CV mean ± sd of every model's CV-best setting; their
     kernel at degree 2n on its own training rows; and every model on the test set."""
     rows = {n: table1_groups(n) for n in NS}
     labels = [label.replace("$2n$", "2n") for label, _ in rows[NS[0]]]
@@ -240,7 +241,7 @@ def table1(final):
     out += [["Their kernel, degree 2n, on its training rows"]]
     out[-1] += [pct(best_of(n, "all", ("kpoly",), top[n])["best"]["train"]) for n in NS]
     out += block("Test set", lambda n, g: pct(test_score(n, g)["mean"]))
-    grid("Table 1: accuracy (%)", out)
+    grid("Table 2: accuracy (%)", out)
 
 
 if __name__ == "__main__":
