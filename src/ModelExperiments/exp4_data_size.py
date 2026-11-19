@@ -17,7 +17,7 @@ from utils import _capped, acc, best_of, grid, load, pct, run, savefig
 
 LOOK = dict(  # label, colour and marker of each learning curve
     wkpoly=("MANBAT", VIOLET, "s"),
-    paper=("Baseline (degree 2, raw inputs)", BLUE, "o"),
+    paper=("Baseline", BLUE, "o"),  # the report's caption: degree 2, raw inputs
     rf=("Random forest", AQUA, "^"),
     mlp=("MLP", MAGENTA, "v"),
 )
@@ -97,7 +97,9 @@ def curve(n, g):
 
 def fig_learning_curves(cands):
     """Test accuracy against the number of training rows."""
-    fig, axes = plt.subplots(1, 3, figsize=(6.75, 3.0), sharey=True, layout="constrained")
+    # drawn at the width it has in the report (0.8 of the 6.75-inch text width), so that its
+    # text stays at 10 pt: include it in LaTeX without scaling
+    fig, axes = plt.subplots(1, 3, figsize=(5.4, 2.6), sharey=True, layout="constrained")
     for ax, n in zip(axes, NS):
         for g in cands[n]:
             S, m, s = (np.array(v) for v in zip(*curve(n, g)))
@@ -114,7 +116,7 @@ def fig_learning_curves(cands):
         ax.set_ylim(0.40, 1.0)
     axes[0].set_ylabel("test accuracy")
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="outside lower center", ncol=2)
+    fig.legend(handles, labels, loc="outside lower center", ncol=4)
     savefig(fig, "fig_learning_curves")
 
 
