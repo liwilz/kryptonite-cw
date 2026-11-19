@@ -7,7 +7,9 @@ import numpy as np
 
 from utils import CV, FIN, LC, MEASURED, WTS, _tracker, text_table
 
-GRID_G_PER_KWH = 125  # NESO, "Britain's Electricity Explained: 2024 Review": GB average for 2024
+# UK electricity consumed, including grid losses: 0.14396 kgCO2e/kWh for data year 2025 (DESNZ,
+# 2026 Government GHG conversion factors for company reporting), the factor the LoRA notebook uses
+GRID_G_PER_KWH = 143.96
 
 
 def carbon_report():
@@ -65,7 +67,7 @@ def carbon_report():
         f"CPU: {', '.join(sorted(cpus))}; energy read from its own counters"
         f" ({', '.join(sorted(modes))}).\nEvery model runs on the CPU only, so no GPU energy is"
         " counted; RAM and screen are not measured.\ng CO2e at"
-        f" {GRID_G_PER_KWH} g per kWh (NESO, GB 2024 average)."
+        f" {GRID_G_PER_KWH} g per kWh (DESNZ, UK 2025 average, including grid losses)."
     )
 
 
