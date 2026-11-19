@@ -43,4 +43,21 @@ Put your predictions in a directory called `hiddenlabels` at the top level of yo
 
 ### Requirements
 
-Python 3 with `numpy`, `scipy`, `scikit-learn`, `torch` and `matplotlib`. Every experiment runs on a laptop CPU.
+Python 3 with `numpy`, `scipy`, `scikit-learn`, `torch`, `matplotlib` and `codecarbon` (tested with 3.3.2; it measures the CPU energy reported in Section 5.3). Every experiment runs on a laptop CPU.
+
+## Reproducing Our Results
+
+The report's LaTeX source is in `paper_source/` (`main.tex`, with Figure 1 in `paper_source/figures/`).
+
+| Report item | Produced by |
+|---|---|
+| Table 2, Figure 1 and the Kryptonite-n numbers in Sections 4.1 and 5.3 | `src/ModelExperiments/Experiments.ipynb` |
+| Table 3 and the LoRA numbers in Sections 2.4, 4.2 and 5.3 | `src/LoRAExperiments/LoRAExperiments.ipynb` |
+| `hiddenlabels/y_predicted_{20,30,40}.npy` | `Experiments.ipynb`, section Hidden-Set Predictions |
+| `hiddenlabels/y_predicted_40_adapt.npy` | `LoRAExperiments.ipynb`, section Hidden-Set Predictions |
+
+Run each notebook from its own folder, top to bottom. `Experiments.ipynb` calls one script per experiment (`exp1_degree.py` to `exp4_data_size.py`, then `final_pipeline.py` and `energy_report.py`); each script also runs on its own in that order, e.g. `python exp1_degree.py`. Figure 1 is saved to `src/ModelExperiments/exp_figures/fig_learning_curves.pdf`; copy it to `paper_source/figures/`.
+
+- **Time and memory.** On an Intel i9-14900HX, `Experiments.ipynb` took about 7 hours and `LoRAExperiments.ipynb` about 20 minutes. MANBAT stores a 32,000 × 32,000 kernel matrix for Kryptonite-40, so `Experiments.ipynb` needs about 5 GB of free memory.
+- **Resuming.** `Experiments.ipynb` stores every finished result in `src/ModelExperiments/exp_cache/` (git-ignored), so an interrupted run resumes where it stopped. Delete that folder for a fresh run.
+- **Dry run.** Set the environment variable `KRYP_QUICK=1` before starting Jupyter or the scripts to run the Kryptonite-n experiments on 3,000 rows with small grids. This only checks that everything runs: its numbers mean nothing and it writes no predictions.
